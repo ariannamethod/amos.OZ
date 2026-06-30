@@ -1,5 +1,5 @@
 #!/bin/sh
-# amosOZ shell treaty smoke suite (non-interactive)
+# amosOZ shell + reference command smoke suite (v0.4)
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/amosoz"
@@ -18,10 +18,28 @@ echo "$out" | grep -q line2 || { echo "FAIL: append"; exit 1; }
 out=$(run 'echo piped | cat')
 echo "$out" | grep -q piped || { echo "FAIL: pipe"; exit 1; }
 
+out=$(run 'cat < /etc/hostname')
+echo "$out" | grep -q amosoz || { echo "FAIL: stdin redirect"; exit 1; }
+
 out=$(run 'which echo')
 echo "$out" | grep -q '/bin/echo' || { echo "FAIL: which"; exit 1; }
 
 out=$(run 'exec /home/user/hello.amos amos')
 echo "$out" | grep -q amos || { echo "FAIL: script"; exit 1; }
 
-echo "shell_treaty: ALL PASSED"
+out=$(run 'echo needle > /tmp/g.txt' 'grep needle /tmp/g.txt')
+echo "$out" | grep -q needle || { echo "FAIL: grep"; exit 1; }
+
+out=$(run 'ln -s /etc/motd /tmp/ml' 'cat /tmp/ml')
+echo "$out" | grep -q amosOZ || { echo "FAIL: symlink"; exit 1; }
+
+out=$(run 'fortune oz')
+echo "$out" | grep -q . || { echo "FAIL: fortune oz"; exit 1; }
+
+out=$(run 'spec')
+echo "$out" | grep -q '0.4.0' || { echo "FAIL: spec"; exit 1; }
+
+out=$(run 'doctor')
+echo "$out" | grep -q healthy || { echo "FAIL: doctor"; exit 1; }
+
+echo "shell_treaty v0.4: ALL PASSED"

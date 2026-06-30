@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <stdarg.h>
 
-#define VERSION "0.3.0"
+#define VERSION "0.4.0"
 #define SYSTEM_NAME "amosOZ"
 #define BUILD_DATE "2026-06-30"
 
@@ -101,6 +101,8 @@ typedef struct {
 typedef struct {
     char path[MAX_PATH];
     int is_dir;
+    int is_symlink;
+    char symlink_target[MAX_PATH];
     char content[MAX_CONTENT];
     char perms[12];
     char owner[16];
@@ -226,6 +228,9 @@ typedef struct {
     int fortune_idx;
     int hook_boot_fired;
     int hook_sched_fired;
+    char boot_log[1024];
+    int job_count;
+    char fortune_oz_idx;
 } Kernel;
 
 static Kernel K;
@@ -273,6 +278,9 @@ static int fs_find(VirtualFS *fs, const char *path);
 static int fs_add_dir(VirtualFS *fs, const char *path);
 static int fs_add_file(VirtualFS *fs, const char *path, const char *content);
 static int dispatch_argv(const char *line, int argc, char **argv, char *output, int outsize);
+static int shell_execute_line(const char *line, char *output, int outsize);
+static void str_trim_inplace(char *s);
+static int proc_is_virtual(const char *path);
 static const char *env_get(const char *key);
 
 typedef int (*CmdFunc)(char*, int, int, char**);
@@ -411,6 +419,59 @@ static void fs_resolve(VirtualFS *fs, const char *path, char *out) {
         strcat(out, "/");
         strcat(out, parts[i]);
     }
+    for (int depth = 0; depth < 8; depth++) {
+        int idx = fs_find(fs, out);
+        if (idx < 0 || !fs->nodes[idx].used || !fs->nodes[idx].is_symlink) break;
+        char tmp[MAX_PATH];
+        fs_resolve(fs, fs->nodes[idx].symlink_target, tmp);
+        strncpy(out, tmp, MAX_PATH - 1);
+        out[MAX_PATH - 1] = '\0';
+    }
+}
+
+static int fs_resolve_node(const char *path) {
+    char resolved[MAX_PATH];
+    fs_resolve(&K.fs, path, resolved);
+    return fs_find(&K.fs, resolved);
+}
+
+static int fs_read_to_buf(const char *path, char *buf, int bufsz) {
+    int idx = fs_resolve_node(path);
+    if (idx < 0) return ERR_NOT_FOUND;
+    if (K.fs.nodes[idx].is_dir || K.fs.nodes[idx].is_symlink) return ERR_INVALID;
+    if (fs_access(&K.fs.nodes[idx], K.user, 'r') != ERR_OK) return ERR_PERMISSION;
+    if (proc_is_virtual(K.fs.nodes[idx].path)) proc_refresh_all();
+    strncpy(buf, K.fs.nodes[idx].content, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    return ERR_OK;
+}
+
+static int patmatch(const char *pat, const char *name) {
+    if (!pat || !name) return 0;
+    if (strcmp(pat, "*") == 0) return 1;
+    const char *star = strchr(pat, '*');
+    if (!star) return strcmp(pat, name) == 0;
+    size_t pre = (size_t)(star - pat);
+    if (strncmp(pat, name, pre) != 0) return 0;
+    const char *suffix = star + 1;
+    size_t slen = strlen(suffix), nlen = strlen(name);
+    if (slen > nlen) return 0;
+    return strcmp(name + nlen - slen, suffix) == 0;
+}
+
+static int fs_add_symlink(VirtualFS *fs, const char *path, const char *target) {
+    if (fs->node_count >= MAX_FILES) return ERR_NO_MEMORY;
+    if (fs_find(fs, path) >= 0) return ERR_EXISTS;
+    int i = fs->node_count++;
+    memset(&fs->nodes[i], 0, sizeof(FSNode));
+    strncpy(fs->nodes[i].path, path, MAX_PATH - 1);
+    fs->nodes[i].is_symlink = 1;
+    fs_resolve(fs, target, fs->nodes[i].symlink_target);
+    strcpy(fs->nodes[i].perms, "lrwxrwxrwx");
+    strcpy(fs->nodes[i].owner, "user");
+    fs->nodes[i].created = fs->nodes[i].modified = time(NULL);
+    fs->nodes[i].used = 1;
+    return ERR_OK;
 }
 
 /* ─── Permission Treaty ───────────────────────────────────────────────────── */
@@ -516,7 +577,8 @@ static int fs_add_file(VirtualFS *fs, const char *path, const char *content) {
 static void fs_init_tree(VirtualFS *fs) {
     const char *dirs[] = {"/", "/bin", "/etc", "/home", "/tmp", "/var", "/dev",
                           "/proc", "/sys", "/usr", "/usr/lib", "/usr/share",
-                          "/home/user", "/var/log", "/etc/amosoz", NULL};
+                          "/usr/share/amosoz", "/home/user", "/var/log",
+                          "/etc/amosoz", NULL};
     for (int i = 0; dirs[i]; i++) fs_add_dir(fs, dirs[i]);
     fs_add_file(fs, "/etc/hostname", "amosoz");
     fs_add_file(fs, "/etc/amosoz/version", VERSION);
@@ -537,7 +599,18 @@ static void fs_init_tree(VirtualFS *fs) {
     fs_add_file(fs, "/proc/version", SYSTEM_NAME " kernel\n");
     fs_add_file(fs, "/proc/self/status", "Name:\tamossh\n");
 
-    const char *bins[] = {"echo", "ls", "cat", "pwd", "uname", "whoami", "date", "help", NULL};
+    fs_add_file(fs, "/usr/share/amosoz/quotes.txt",
+        "A conflict begins and ends in the hearts of men, not in the hills.\n"
+        "The opposite of indifference is not love but curiosity.\n"
+        "We all pay a price for our dreams.\n"
+        "עוז — strength lives in the willingness to see the other.\n"
+        "Literature is a chamber of justice without a judge.\n");
+    const char *bins[] = {
+        "echo", "ls", "cat", "pwd", "uname", "whoami", "date", "help",
+        "grep", "head", "tail", "wc", "test", "hostname", "id", "true", "false",
+        "uptime", "dmesg", "find", "ln", "export", "source", "spec", "doctor",
+        NULL
+    };
     for (int i = 0; bins[i]; i++) {
         char bpath[MAX_PATH];
         char bcontent[48];
@@ -853,6 +926,12 @@ static void kernel_init(void) {
 
     K.hook_boot_fired = fire_hook("boot");
     K.hook_sched_fired = 0;
+    K.job_count = 1;
+    K.fortune_oz_idx = 0;
+    snprintf(K.boot_log, sizeof(K.boot_log),
+        "[boot] amosOZ %s started\n[boot] %d hook subscribers on boot\n"
+        "[boot] dedicated to Amos Oz (עוז)\n",
+        VERSION, K.hook_boot_fired);
     proc_refresh_all();
     (void)validate_module_contracts();
 }
@@ -1112,12 +1191,20 @@ static int cmd_cd(char *out, int sz, int argc, char **argv) {
 }
 
 static int cmd_ls(char *out, int sz, int argc, char **argv) {
+    int long_fmt = 0, show_all = 0;
     char resolved[MAX_PATH];
-    if (argc > 1) fs_resolve(&K.fs, argv[1], resolved);
-    else strcpy(resolved, K.fs.cwd);
+    strcpy(resolved, K.fs.cwd);
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-') {
+            if (strstr(argv[i], "l")) long_fmt = 1;
+            if (strstr(argv[i], "a")) show_all = 1;
+        } else {
+            fs_resolve(&K.fs, argv[i], resolved);
+        }
+    }
 
     int idx = fs_find(&K.fs, resolved);
-    if (idx < 0 || !K.fs.nodes[idx].is_dir) {
+    if (idx < 0 || (!K.fs.nodes[idx].is_dir && !K.fs.nodes[idx].is_symlink)) {
         snprintf(out, sz, "ls: no such directory");
         return ERR_NOT_FOUND;
     }
@@ -1126,15 +1213,31 @@ static int cmd_ls(char *out, int sz, int argc, char **argv) {
     char prefix[MAX_PATH];
     if (strcmp(resolved, "/") == 0) strcpy(prefix, "/");
     else snprintf(prefix, MAX_PATH, "%s/", resolved);
-    int plen = strlen(prefix);
+    int plen = (int)strlen(prefix);
 
     for (int i = 0; i < K.fs.node_count; i++) {
         if (!K.fs.nodes[i].used) continue;
         if (strncmp(K.fs.nodes[i].path, prefix, plen) != 0) continue;
         const char *rest = K.fs.nodes[i].path + plen;
         if (strlen(rest) == 0 || strchr(rest, '/') != NULL) continue;
-        n = safe_append(out, n, sz, "%s %s%s\n", K.fs.nodes[i].perms, rest,
-                      K.fs.nodes[i].is_dir ? "/" : "");
+        if (!show_all && rest[0] == '.') continue;
+        FSNode *node = &K.fs.nodes[i];
+        if (long_fmt) {
+            char tbuf[32];
+            struct tm *tm = localtime(&node->modified);
+            strftime(tbuf, sizeof(tbuf), "%b %d %H:%M", tm);
+            int size = node->is_dir ? 4096 : (node->is_symlink ? 0 : (int)strlen(node->content));
+            n = safe_append(out, n, sz, "%s %3d %-8s %-8s %5d %s %s%s\n",
+                node->perms, 1, node->owner, node->owner, size, tbuf, rest,
+                node->is_dir ? "/" : (node->is_symlink ? " -> " : ""));
+            if (node->is_symlink)
+                n = safe_append(out, n, sz, "%s", node->symlink_target);
+            n = safe_append(out, n, sz, "\n");
+        } else {
+            n = safe_append(out, n, sz, "%s %s%s%s\n", node->perms, rest,
+                node->is_dir ? "/" : "",
+                node->is_symlink ? "@" : "");
+        }
     }
     if (n == 0) out[0] = '\0';
     return ERR_OK;
@@ -1615,6 +1718,304 @@ static int cmd_clear(char *out, int sz, int argc, char **argv) {
     return ERR_OK;
 }
 
+/* ─── Tier A–E commands (v0.4 reference set) ──────────────────────────────── */
+static int cmd_grep(char *out, int sz, int argc, char **argv) {
+    int insensitive = 0, ai = 1;
+    if (argc > 1 && strcmp(argv[1], "-i") == 0) { insensitive = 1; ai = 2; }
+    if (argc <= ai) { snprintf(out, sz, "Usage: grep [-i] PATTERN [file]"); return ERR_INVALID; }
+    char data[MAX_CONTENT];
+    int err;
+    if (argc > ai + 1) err = fs_read_to_buf(argv[ai + 1], data, sizeof(data));
+    else if (shell_stdin_len > 0) {
+        strncpy(data, shell_stdin_buf, sizeof(data) - 1);
+        data[sizeof(data) - 1] = '\0';
+        err = ERR_OK;
+    } else { snprintf(out, sz, "grep: no input"); return ERR_INVALID; }
+    if (err != ERR_OK) { snprintf(out, sz, "grep: cannot read input"); return err; }
+    const char *pat = argv[ai];
+    int n = 0;
+    char *save = NULL;
+    char dcopy[MAX_CONTENT];
+    strncpy(dcopy, data, sizeof(dcopy) - 1);
+    for (char *line = strtok_r(dcopy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        int match = 0;
+        if (insensitive) {
+            char a[256], b[512];
+            strncpy(a, pat, sizeof(a) - 1);
+            strncpy(b, line, sizeof(b) - 1);
+            for (char *p = a; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+            for (char *p = b; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+            match = strstr(b, a) != NULL;
+        } else match = strstr(line, pat) != NULL;
+        if (match) n = safe_append(out, n, sz, "%s\n", line);
+    }
+    if (n == 0) out[0] = '\0';
+    return ERR_OK;
+}
+
+static int cmd_head(char *out, int sz, int argc, char **argv) {
+    int lines = 10, fi = 1;
+    if (argc > 2 && strcmp(argv[1], "-n") == 0) { lines = atoi(argv[2]); fi = 3; }
+    char data[MAX_CONTENT];
+    int err;
+    if (argc > fi) err = fs_read_to_buf(argv[fi], data, sizeof(data));
+    else if (shell_stdin_len > 0) { strncpy(data, shell_stdin_buf, sizeof(data)-1); err = ERR_OK; }
+    else { snprintf(out, sz, "Usage: head [-n N] [file]"); return ERR_INVALID; }
+    if (err != ERR_OK) return err;
+    int n = 0, count = 0;
+    char *save = NULL;
+    char dcopy[MAX_CONTENT];
+    strncpy(dcopy, data, sizeof(dcopy)-1);
+    for (char *line = strtok_r(dcopy, "\n", &save); line && count < lines;
+         line = strtok_r(NULL, "\n", &save), count++)
+        n = safe_append(out, n, sz, "%s\n", line);
+    if (n == 0) out[0] = '\0';
+    return ERR_OK;
+}
+
+static int cmd_tail(char *out, int sz, int argc, char **argv) {
+    int lines = 10, fi = 1;
+    if (argc > 2 && strcmp(argv[1], "-n") == 0) { lines = atoi(argv[2]); fi = 3; }
+    char data[MAX_CONTENT];
+    int err;
+    if (argc > fi) err = fs_read_to_buf(argv[fi], data, sizeof(data));
+    else if (shell_stdin_len > 0) { strncpy(data, shell_stdin_buf, sizeof(data)-1); err = ERR_OK; }
+    else { snprintf(out, sz, "Usage: tail [-n N] [file]"); return ERR_INVALID; }
+    if (err != ERR_OK) return err;
+    char *all[256];
+    int count = 0;
+    char *save = NULL;
+    char dcopy[MAX_CONTENT];
+    strncpy(dcopy, data, sizeof(dcopy)-1);
+    for (char *line = strtok_r(dcopy, "\n", &save); line && count < 256;
+         line = strtok_r(NULL, "\n", &save))
+        all[count++] = line;
+    int start = count > lines ? count - lines : 0;
+    int n = 0;
+    for (int i = start; i < count; i++) n = safe_append(out, n, sz, "%s\n", all[i]);
+    if (n == 0) out[0] = '\0';
+    return ERR_OK;
+}
+
+static int cmd_wc(char *out, int sz, int argc, char **argv) {
+    int want_l = 0, want_w = 0, want_c = 0;
+    int fi = 1;
+    for (; fi < argc && argv[fi][0] == '-'; fi++) {
+        if (strchr(argv[fi], 'l')) want_l = 1;
+        if (strchr(argv[fi], 'w')) want_w = 1;
+        if (strchr(argv[fi], 'c')) want_c = 1;
+    }
+    if (!want_l && !want_w && !want_c) want_l = 1;
+    char data[MAX_CONTENT];
+    int err;
+    if (fi < argc) err = fs_read_to_buf(argv[fi], data, sizeof(data));
+    else if (shell_stdin_len > 0) { strncpy(data, shell_stdin_buf, sizeof(data)-1); err = ERR_OK; }
+    else { snprintf(out, sz, "Usage: wc [-l|-w|-c] [file]"); return ERR_INVALID; }
+    if (err != ERR_OK) return err;
+    int lines = 0, words = 0, chars = (int)strlen(data);
+    char *save = NULL;
+    char dcopy[MAX_CONTENT];
+    strncpy(dcopy, data, sizeof(dcopy)-1);
+    for (char *line = strtok_r(dcopy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        lines++;
+        char *ws = NULL;
+        for (char *w = strtok_r(line, " \t", &ws); w; w = strtok_r(NULL, " \t", &ws)) if (w[0]) words++;
+    }
+    int n = 0;
+    if (want_l) n = safe_append(out, n, sz, "%d", lines);
+    if (want_w) n = safe_append(out, n, sz, "%s%d", want_l ? " " : "", words);
+    if (want_c) n = safe_append(out, n, sz, "%s%d", (want_l||want_w) ? " " : "", chars);
+    return ERR_OK;
+}
+
+static int cmd_test(char *out, int sz, int argc, char **argv) {
+    out[0] = '\0';
+    if (argc < 2) return ERR_INVALID;
+    if (argc >= 2 && strcmp(argv[argc - 1], "]") == 0) argc--;
+    if (strcmp(argv[1], "-f") == 0 && argc >= 3) {
+        int idx = fs_resolve_node(argv[2]);
+        if (idx < 0) return ERR_INVALID;
+        return (!K.fs.nodes[idx].is_dir && !K.fs.nodes[idx].is_symlink) ? ERR_OK : ERR_INVALID;
+    }
+    if (strcmp(argv[1], "-d") == 0 && argc >= 3) {
+        int idx = fs_resolve_node(argv[2]);
+        return (idx >= 0 && K.fs.nodes[idx].is_dir) ? ERR_OK : ERR_INVALID;
+    }
+    if (strcmp(argv[1], "-e") == 0 && argc >= 3)
+        return fs_resolve_node(argv[2]) >= 0 ? ERR_OK : ERR_INVALID;
+    if (strcmp(argv[1], "-z") == 0 && argc >= 3)
+        return (argv[2][0] == '\0') ? ERR_OK : ERR_INVALID;
+    if (argc >= 4 && strcmp(argv[2], "=") == 0)
+        return strcmp(argv[1], argv[3]) == 0 ? ERR_OK : ERR_INVALID;
+    return ERR_INVALID;
+}
+
+static int cmd_export(char *out, int sz, int argc, char **argv) {
+    if (argc < 2) { snprintf(out, sz, "Usage: export KEY=VAL"); return ERR_INVALID; }
+    char pair[160];
+    strncpy(pair, argv[1], sizeof(pair) - 1);
+    pair[sizeof(pair) - 1] = '\0';
+    char *eq = strchr(pair, '=');
+    if (!eq) {
+        const char *v = env_get(pair);
+        snprintf(out, sz, "%s=%s", pair, v ? v : "");
+        return ERR_OK;
+    }
+    *eq = '\0';
+    env_set(pair, eq + 1);
+    out[0] = '\0';
+    return ERR_OK;
+}
+
+static int cmd_source(char *out, int sz, int argc, char **argv) {
+    if (argc < 2) { snprintf(out, sz, "Usage: source <file>"); return ERR_INVALID; }
+    char resolved[MAX_PATH];
+    fs_resolve(&K.fs, argv[1], resolved);
+    int idx = fs_resolve_node(resolved);
+    if (idx < 0) { snprintf(out, sz, "source: %s: not found", argv[1]); return ERR_NOT_FOUND; }
+    char body[MAX_CONTENT];
+    if (K.fs.nodes[idx].is_symlink || K.fs.nodes[idx].is_dir) return ERR_INVALID;
+    strncpy(body, K.fs.nodes[idx].content, sizeof(body)-1);
+    char *start = body;
+    if (strncmp(start, "#!", 2) == 0) {
+        char *nl = strchr(start, '\n');
+        start = nl ? nl + 1 : start;
+    }
+    int outpos = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(start, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        str_trim_inplace(line);
+        if (!line[0] || line[0] == '#') continue;
+        char segout[4096];
+        shell_execute_line(line, segout, sizeof(segout));
+        if (segout[0]) outpos = safe_append(out, outpos, sz, "%s%s", outpos ? "\n" : "", segout);
+    }
+    return ERR_OK;
+}
+
+static int cmd_uptime(char *out, int sz, int argc, char **argv) {
+    int elapsed = (int)(time(NULL) - K.boot_time);
+    snprintf(out, sz, "up %d seconds, %d users, load: 0.00 0.00 0.00",
+        elapsed, 1);
+    return ERR_OK;
+}
+
+static int cmd_dmesg(char *out, int sz, int argc, char **argv) {
+    snprintf(out, sz, "%s", K.boot_log);
+    return ERR_OK;
+}
+
+static int cmd_hostname(char *out, int sz, int argc, char **argv) {
+    if (argc > 1) { snprintf(out, sz, "hostname: read-only virtual hostname"); return ERR_INVALID; }
+    char *ha[] = {"/etc/hostname"};
+    int err = kernel_syscall("read", out, sz, 1, ha);
+    if (err != ERR_OK) snprintf(out, sz, "%s", K.hw.hostname);
+    return ERR_OK;
+}
+
+static int cmd_id(char *out, int sz, int argc, char **argv) {
+    snprintf(out, sz, "uid=%s(%s) gid=%s(%s) groups=%s",
+        K.user, K.user, K.user, K.user, K.user);
+    return ERR_OK;
+}
+
+static int cmd_true(char *out, int sz, int argc, char **argv) {
+    out[0] = '\0';
+    return ERR_OK;
+}
+
+static int cmd_false(char *out, int sz, int argc, char **argv) {
+    out[0] = '\0';
+    return ERR_INVALID;
+}
+
+static int cmd_ln(char *out, int sz, int argc, char **argv) {
+    if (argc < 4 || strcmp(argv[1], "-s") != 0) {
+        snprintf(out, sz, "Usage: ln -s <target> <linkpath>");
+        return ERR_INVALID;
+    }
+    char linkpath[MAX_PATH];
+    fs_resolve(&K.fs, argv[3], linkpath);
+    int err = fs_add_symlink(&K.fs, linkpath, argv[2]);
+    if (err != ERR_OK) snprintf(out, sz, "ln: failed");
+    else out[0] = '\0';
+    return err;
+}
+
+static int cmd_find(char *out, int sz, int argc, char **argv) {
+    char root[MAX_PATH] = "/";
+    char pattern[128] = "*";
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-name") == 0 && i + 1 < argc) { strncpy(pattern, argv[++i], 127); }
+        else if (argv[i][0] == '/') strncpy(root, argv[i], MAX_PATH-1);
+    }
+    char rprefix[MAX_PATH];
+    if (strcmp(root, "/") == 0) strcpy(rprefix, "/");
+    else snprintf(rprefix, sizeof(rprefix), "%s/", root);
+    int rlen = (int)strlen(rprefix);
+    int n = 0;
+    for (int i = 0; i < K.fs.node_count; i++) {
+        if (!K.fs.nodes[i].used) continue;
+        if (strncmp(K.fs.nodes[i].path, rprefix, rlen) != 0 &&
+            strcmp(K.fs.nodes[i].path, root) != 0) continue;
+        const char *base = strrchr(K.fs.nodes[i].path, '/');
+        base = base ? base + 1 : K.fs.nodes[i].path;
+        if (patmatch(pattern, base))
+            n = safe_append(out, n, sz, "%s\n", K.fs.nodes[i].path);
+    }
+    if (n == 0) out[0] = '\0';
+    return ERR_OK;
+}
+
+static int cmd_jobs(char *out, int sz, int argc, char **argv) {
+    snprintf(out, sz, "[1]+ Running (stub) amossh (pid 1)\n[2]- Running (stub) init (pid 2)");
+    return ERR_OK;
+}
+
+static int cmd_fg(char *out, int sz, int argc, char **argv) {
+    snprintf(out, sz, "fg: job control stub — foreground is always the shell");
+    return ERR_OK;
+}
+
+static int cmd_nohup(char *out, int sz, int argc, char **argv) {
+    if (argc < 2) { snprintf(out, sz, "Usage: nohup <command>"); return ERR_INVALID; }
+    char cmdline[MAX_CMD_LEN];
+    int pos = 0;
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) cmdline[pos++] = ' ';
+        pos += snprintf(cmdline + pos, sizeof(cmdline) - pos, "%s", argv[i]);
+    }
+    char segout[4096];
+    int err = shell_execute_line(cmdline, segout, sizeof(segout));
+    snprintf(out, sz, "nohup: ignoring SIGHUP (stub)\n%s", segout);
+    return err;
+}
+
+static int cmd_spec(char *out, int sz, int argc, char **argv) {
+    snprintf(out, sz,
+        "amosOZ spec %s\nfeatures: permissions,syscall,/proc,ledger,undo,shell,scripts,PATH\n"
+        "shell: >,>>,|,<  text: grep,head,tail,wc,test  fs: ln,find  meta: export,source\n"
+        "stubs: jobs,fg,nohup  oz: fortune oz, /usr/share/amosoz\nselftest: 45+  canonical: C\n",
+        VERSION);
+    return ERR_OK;
+}
+
+static int cmd_doctor(char *out, int sz, int argc, char **argv) {
+    int issues = 0;
+    int n = 0;
+    n = safe_append(out, n, sz, "amosOZ doctor:\n");
+    if (validate_module_contracts() != ERR_OK) { n = safe_append(out, n, sz, "  [FAIL] contracts\n"); issues++; }
+    else n = safe_append(out, n, sz, "  [OK] contracts\n");
+    if (K.hook_boot_fired <= 0) { n = safe_append(out, n, sz, "  [FAIL] boot hooks\n"); issues++; }
+    else n = safe_append(out, n, sz, "  [OK] boot hooks (%d)\n", K.hook_boot_fired);
+    if (fs_find(&K.fs, "/proc/uptime") < 0) { n = safe_append(out, n, sz, "  [FAIL] /proc\n"); issues++; }
+    else n = safe_append(out, n, sz, "  [OK] /proc\n");
+    if (fs_find(&K.fs, "/usr/share/amosoz/quotes.txt") < 0) { n = safe_append(out, n, sz, "  [WARN] oz quotes\n"); }
+    else n = safe_append(out, n, sz, "  [OK] oz quotes\n");
+    n = safe_append(out, n, sz, issues ? "  STATUS: needs attention\n" : "  STATUS: healthy\n");
+    return issues ? ERR_INVALID : ERR_OK;
+}
+
 static const char *fortunes[] = {
     "The system is the territory.",
     "Every overhead has a name.",
@@ -1624,6 +2025,24 @@ static const char *fortunes[] = {
 };
 
 static int cmd_fortune(char *out, int sz, int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "oz") == 0) {
+        char quotes[MAX_CONTENT];
+        if (fs_read_to_buf("/usr/share/amosoz/quotes.txt", quotes, sizeof(quotes)) != ERR_OK) {
+            snprintf(out, sz, "fortune oz: quotes not found");
+            return ERR_NOT_FOUND;
+        }
+        char *lines[32];
+        int lc = 0;
+        char *save = NULL;
+        char qcopy[MAX_CONTENT];
+        strncpy(qcopy, quotes, sizeof(qcopy)-1);
+        for (char *l = strtok_r(qcopy, "\n", &save); l && lc < 32; l = strtok_r(NULL, "\n", &save))
+            if (l[0]) lines[lc++] = l;
+        if (lc == 0) { snprintf(out, sz, "(no oz quotes)"); return ERR_OK; }
+        snprintf(out, sz, "%s", lines[K.fortune_oz_idx % lc]);
+        K.fortune_oz_idx++;
+        return ERR_OK;
+    }
     snprintf(out, sz, "%s", fortunes[K.fortune_idx % 5]);
     K.fortune_idx++;
     return ERR_OK;
@@ -1640,7 +2059,7 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
 
     CHECK("boot_state", K.boot_time > 0);
     CHECK("hw_profile", strlen(K.hw.platform) > 0);
-    CHECK("version", strcmp(VERSION, "0.3.0") == 0);
+    CHECK("version", strcmp(VERSION, "0.4.0") == 0);
 
     /* Filesystem */
     fs_add_file(&K.fs, "/tmp/selftest_file", "hello");
@@ -1753,6 +2172,42 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
     dispatch("exec /home/user/hello.amos resonance", tmp, sizeof(tmp));
     CHECK("script_exec", strstr(tmp, "Script greeting") != NULL && strstr(tmp, "resonance") != NULL);
 
+    /* v0.4 reference tiers */
+    dispatch("echo grepme > /tmp/grep.txt", tmp, sizeof(tmp));
+    dispatch("grep grepme /tmp/grep.txt", tmp, sizeof(tmp));
+    CHECK("cmd_grep", strstr(tmp, "grepme") != NULL);
+
+    dispatch("head -n 1 /etc/motd", tmp, sizeof(tmp));
+    CHECK("cmd_head", tmp[0] != '\0');
+
+    dispatch("wc -l /etc/motd", tmp, sizeof(tmp));
+    CHECK("cmd_wc", atoi(tmp) >= 1);
+
+    { char *targv[] = {"test", "-f", "/etc/hostname"};
+      CHECK("cmd_test", cmd_test(tmp, (int)sizeof(tmp), 3, targv) == ERR_OK); }
+
+    dispatch("ln -s /etc/motd /tmp/motd_link", tmp, sizeof(tmp));
+    CHECK("cmd_ln", fs_resolve_node("/tmp/motd_link") >= 0);
+
+    dispatch("find /usr -name quotes.txt", tmp, sizeof(tmp));
+    CHECK("cmd_find", strstr(tmp, "quotes.txt") != NULL);
+
+    dispatch("export TIER=v4", tmp, sizeof(tmp));
+    dispatch("export TIER", tmp, sizeof(tmp));
+    CHECK("cmd_export", strstr(tmp, "TIER=v4") != NULL);
+
+    dispatch("fortune oz", tmp, sizeof(tmp));
+    CHECK("fortune_oz", tmp[0] != '\0');
+
+    dispatch("spec", tmp, sizeof(tmp));
+    CHECK("cmd_spec", strstr(tmp, "0.4.0") != NULL);
+
+    dispatch("doctor", tmp, sizeof(tmp));
+    CHECK("cmd_doctor", strstr(tmp, "healthy") != NULL);
+
+    dispatch("cat < /etc/hostname", tmp, sizeof(tmp));
+    CHECK("shell_stdin_redirect", strstr(tmp, "amosoz") != NULL);
+
     /* Summary */
     char header[64];
     snprintf(header, sizeof(header), "amosOZ Selftest (%d/%d passed):\n", passed, total);
@@ -1782,6 +2237,13 @@ static void str_trim_inplace(char *s) {
 static int is_script_node(int idx) {
     if (idx < 0) return 0;
     FSNode *n = &K.fs.nodes[idx];
+    if (n->is_symlink) {
+        char resolved[MAX_PATH];
+        fs_resolve(&K.fs, n->symlink_target, resolved);
+        idx = fs_find(&K.fs, resolved);
+        if (idx < 0) return 0;
+        n = &K.fs.nodes[idx];
+    }
     if (n->is_dir) return 0;
     if (strstr(n->path, ".amos")) return 1;
     return strncmp(n->content, "#!/amossh", 9) == 0;
@@ -1865,9 +2327,17 @@ static int shell_redirect_write(const char *path, const char *data, int append) 
     return ERR_OK;
 }
 
-static void shell_parse_redirect(char *seg, char *redir_path, int *append) {
+static void shell_parse_redirect(char *seg, char *redir_path, int *append, char *redir_in) {
     redir_path[0] = '\0';
+    redir_in[0] = '\0';
     *append = 0;
+    char *in = strchr(seg, '<');
+    if (in) {
+        *in = '\0';
+        str_trim_inplace(seg);
+        strncpy(redir_in, in + 1, MAX_PATH - 1);
+        str_trim_inplace(redir_in);
+    }
     char *p = strstr(seg, ">>");
     if (p) {
         *p = '\0';
@@ -2004,10 +2474,23 @@ static int dispatch_argv(const char *line, int argc, char **argv, char *output, 
 static int shell_execute_segment(const char *seg, const char *line, char *output, int outsize) {
     char work[MAX_CMD_LEN];
     char redir[MAX_PATH];
+    char redir_in[MAX_PATH];
     int append = 0;
     strncpy(work, seg, MAX_CMD_LEN - 1);
     work[MAX_CMD_LEN - 1] = '\0';
-    shell_parse_redirect(work, redir, &append);
+    shell_parse_redirect(work, redir, &append, redir_in);
+
+    if (redir_in[0]) {
+        char inbuf[MAX_CONTENT];
+        int ierr = fs_read_to_buf(redir_in, inbuf, sizeof(inbuf));
+        if (ierr != ERR_OK) {
+            snprintf(output, outsize, "amosoz: %s: cannot open for input", redir_in);
+            return ierr;
+        }
+        shell_stdin_len = (int)strlen(inbuf);
+        strncpy(shell_stdin_buf, inbuf, MAX_CONTENT - 1);
+        shell_stdin_buf[MAX_CONTENT - 1] = '\0';
+    }
 
     char buf[MAX_CMD_LEN];
     strncpy(buf, work, MAX_CMD_LEN - 1);
@@ -2136,6 +2619,14 @@ static const CmdEntry CMD_TABLE[] = {
     {"trace", cmd_trace}, {"replay", cmd_replay}, {"undo", cmd_undo},
     {"whoami", cmd_whoami}, {"motd", cmd_motd}, {"syscall", cmd_syscall},
     {"which", cmd_which}, {"exec", cmd_exec},
+    {"grep", cmd_grep}, {"head", cmd_head}, {"tail", cmd_tail}, {"wc", cmd_wc},
+    {"test", cmd_test}, {"[", cmd_test},
+    {"export", cmd_export}, {"source", cmd_source},
+    {"uptime", cmd_uptime}, {"dmesg", cmd_dmesg}, {"hostname", cmd_hostname},
+    {"id", cmd_id}, {"true", cmd_true}, {"false", cmd_false},
+    {"ln", cmd_ln}, {"find", cmd_find},
+    {"jobs", cmd_jobs}, {"fg", cmd_fg}, {"nohup", cmd_nohup},
+    {"spec", cmd_spec}, {"doctor", cmd_doctor},
     {"reset", cmd_reset},
     {"save", cmd_save}, {"load", cmd_load}, {"fortune", cmd_fortune},
     {NULL, NULL}

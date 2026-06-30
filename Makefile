@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -Wall -Wextra -O2
 LDFLAGS ?= -lm
 
-.PHONY: all run test test-shell clean
+.PHONY: all run test test-shell test-all clean
 
 all: amosoz
 
@@ -17,6 +17,8 @@ test: amosoz
 
 test-shell: amosoz
 	sh tests/shell_treaty.sh
+
+test-all: test test-shell
 
 clean:
 	rm -f amosoz amosoz_neo amosoz.img
