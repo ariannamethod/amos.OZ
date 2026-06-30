@@ -17,9 +17,15 @@
 #include <unistd.h>
 #include <stdarg.h>
 
-#define VERSION "0.1.0"
+#define VERSION "0.3.0"
 #define SYSTEM_NAME "amosOZ"
 #define BUILD_DATE "2026-06-30"
+
+#define MOTD \
+    "amosOZ v" VERSION " — Arianna Method Operating System\n" \
+    "Dedicated to Amos Oz (עוז — strength, courage)\n" \
+    "Compatibility is a treaty, not obedience.\n" \
+    "Type 'help', 'selftest', or 'motd'. Every command leaves a trace.\n\n"
 
 /* Guard against snprintf overflow: clamp n to buffer size */
 static inline int safe_append(char *buf, int offset, int bufsz, const char *fmt, ...) __attribute__((format(printf,4,5)));
@@ -129,12 +135,18 @@ typedef struct {
 /* "Every command leaves a trace." */
 typedef struct {
     char command[MAX_CMD_LEN];
+    char parsed_cmd[32];
+    char parsed_args[256];
     char actor[16];
     int tick;
     time_t timestamp;
     int result_code;
     char explanation[128];
     int reversible;
+    char undo_path[MAX_PATH];
+    char undo_content[MAX_CONTENT];
+    int undo_is_dir;
+    int undo_was_create;
 } LedgerEntry;
 
 typedef struct {
@@ -212,13 +224,60 @@ typedef struct {
     char user[16];
     int running;
     int fortune_idx;
+    int hook_boot_fired;
+    int hook_sched_fired;
 } Kernel;
 
 static Kernel K;
 
+typedef struct {
+    int active;
+    int reversible;
+    char explanation[128];
+    char undo_path[MAX_PATH];
+    char undo_content[MAX_CONTENT];
+    int undo_is_dir;
+    int undo_was_create;
+} LedgerMeta;
+
+static LedgerMeta pending_ledger;
+
+#define MAX_SCRIPT_DEPTH 8
+static char shell_stdin_buf[MAX_CONTENT];
+static int shell_stdin_len;
+static int shell_depth;
+
+static void ledger_meta_clear(void) { memset(&pending_ledger, 0, sizeof(pending_ledger)); }
+
+static void ledger_meta_set(int reversible, const char *explanation,
+                            const char *undo_path, const char *undo_content,
+                            int undo_is_dir, int undo_was_create) {
+    pending_ledger.active = 1;
+    pending_ledger.reversible = reversible;
+    snprintf(pending_ledger.explanation, sizeof(pending_ledger.explanation), "%s", explanation);
+    if (undo_path) strncpy(pending_ledger.undo_path, undo_path, MAX_PATH-1);
+    if (undo_content) strncpy(pending_ledger.undo_content, undo_content, MAX_CONTENT-1);
+    pending_ledger.undo_is_dir = undo_is_dir;
+    pending_ledger.undo_was_create = undo_was_create;
+}
+
 /* ─── Forward declarations ────────────────────────────────────────────────── */
 static void kernel_init(void);
 static int dispatch(const char *line, char *output, int outsize);
+static int kernel_syscall(const char *op, char *out, int outsz, int argc, char **argv);
+static void proc_refresh_all(void);
+static int fire_hook(const char *hook_name);
+static int fs_access(const FSNode *n, const char *user, char op);
+static int validate_module_contracts(void);
+static int fs_find(VirtualFS *fs, const char *path);
+static int fs_add_dir(VirtualFS *fs, const char *path);
+static int fs_add_file(VirtualFS *fs, const char *path, const char *content);
+static int dispatch_argv(const char *line, int argc, char **argv, char *output, int outsize);
+static const char *env_get(const char *key);
+
+typedef int (*CmdFunc)(char*, int, int, char**);
+typedef struct { const char *name; CmdFunc func; } CmdEntry;
+static const CmdEntry CMD_TABLE[];
 
 /* ─── Hardware Detection ──────────────────────────────────────────────────── */
 /* Detection must never crash. Unknown = "unknown". */
@@ -354,6 +413,72 @@ static void fs_resolve(VirtualFS *fs, const char *path, char *out) {
     }
 }
 
+/* ─── Permission Treaty ───────────────────────────────────────────────────── */
+static int perm_bit(const char *perms, int bit_idx) {
+    if (!perms || (int)strlen(perms) < 9) return 0;
+    return perms[bit_idx] != '-';
+}
+
+static int fs_access(const FSNode *n, const char *user, char op) {
+    if (!n || !n->used) return ERR_NOT_FOUND;
+    if (strcmp(user, "root") == 0) return ERR_OK;
+    int base = (strcmp(n->owner, user) == 0) ? 0 : 6;
+    int bit = base;
+    if (op == 'r') bit += 0;
+    else if (op == 'w') bit += 1;
+    else if (op == 'x') bit += 2;
+    else return ERR_INVALID;
+    return perm_bit(n->perms, bit) ? ERR_OK : ERR_PERMISSION;
+}
+
+static int proc_is_virtual(const char *path) {
+    return path && (strncmp(path, "/proc/", 6) == 0 || strcmp(path, "/proc") == 0);
+}
+
+static void proc_write_file(const char *path, const char *content) {
+    int idx = fs_find(&K.fs, path);
+    if (idx < 0) {
+        fs_add_file(&K.fs, path, content);
+        idx = fs_find(&K.fs, path);
+    }
+    if (idx >= 0) {
+        strncpy(K.fs.nodes[idx].content, content, MAX_CONTENT - 1);
+        K.fs.nodes[idx].content[MAX_CONTENT - 1] = '\0';
+        strcpy(K.fs.nodes[idx].perms, "r--r--r--");
+        strcpy(K.fs.nodes[idx].owner, "root");
+        K.fs.nodes[idx].modified = time(NULL);
+    }
+}
+
+static void proc_refresh_all(void) {
+    char buf[MAX_CONTENT];
+    int elapsed = (int)(time(NULL) - K.boot_time);
+
+    snprintf(buf, sizeof(buf), "%d.%d\n", elapsed, 0);
+    proc_write_file("/proc/uptime", buf);
+
+    snprintf(buf, sizeof(buf),
+        "MemTotal:       %d kB\nMemFree:        %d kB\nMemAvailable:   %d kB\n",
+        K.mem.total_kb, K.mem.total_kb - K.mem.used_kb, K.mem.total_kb - K.mem.used_kb);
+    proc_write_file("/proc/meminfo", buf);
+
+    snprintf(buf, sizeof(buf),
+        "processor\t: 0\nmodel name\t: amosOZ virtual cpu\n"
+        "cpu cores\t: %d\nhostname\t: %s\n",
+        K.hw.cpu_count > 0 ? K.hw.cpu_count : 1, K.hw.hostname);
+    proc_write_file("/proc/cpuinfo", buf);
+
+    snprintf(buf, sizeof(buf), "%s %s %s %s\n",
+        SYSTEM_NAME, VERSION, K.hw.machine, K.hw.platform);
+    proc_write_file("/proc/version", buf);
+
+    snprintf(buf, sizeof(buf),
+        "Name:\tamossh\nPid:\t1\nState:\trunning (virtual)\nUid:\t1000\nGid:\t1000\n"
+        "VmSize:\t%d kB\nThreads:\t%d\n",
+        K.mem.used_kb, K.procs.next_pid - 1);
+    proc_write_file("/proc/self/status", buf);
+}
+
 static int fs_add_dir(VirtualFS *fs, const char *path) {
     if (fs->node_count >= MAX_FILES) return ERR_NO_MEMORY;
     if (fs_find(fs, path) >= 0) return ERR_EXISTS;
@@ -395,6 +520,46 @@ static void fs_init_tree(VirtualFS *fs) {
     for (int i = 0; dirs[i]; i++) fs_add_dir(fs, dirs[i]);
     fs_add_file(fs, "/etc/hostname", "amosoz");
     fs_add_file(fs, "/etc/amosoz/version", VERSION);
+    fs_add_file(fs, "/etc/motd",
+        "amosOZ — Arianna Method Operating System\n"
+        "Dedicated to Amos Oz (עוז)\n"
+        "OZ begins where extension becomes accountable.\n");
+    fs_add_file(fs, "/etc/os-release",
+        "NAME=\"amosOZ\"\n"
+        "PRETTY_NAME=\"amosOZ (Arianna Method Operating System)\"\n"
+        "ID=amosoz\n"
+        "VERSION_ID=\"" VERSION "\"\n"
+        "HOME_URL=\"https://github.com/ariannamethod/amos.OZ\"\n"
+        "SUPPORT_END=\"never\"\n");
+    fs_add_file(fs, "/proc/uptime", "0.0\n");
+    fs_add_file(fs, "/proc/meminfo", "MemTotal: 65536 kB\n");
+    fs_add_file(fs, "/proc/cpuinfo", "processor\t: 0\n");
+    fs_add_file(fs, "/proc/version", SYSTEM_NAME " kernel\n");
+    fs_add_file(fs, "/proc/self/status", "Name:\tamossh\n");
+
+    const char *bins[] = {"echo", "ls", "cat", "pwd", "uname", "whoami", "date", "help", NULL};
+    for (int i = 0; bins[i]; i++) {
+        char bpath[MAX_PATH];
+        char bcontent[48];
+        snprintf(bpath, sizeof(bpath), "/bin/%s", bins[i]);
+        snprintf(bcontent, sizeof(bcontent), "#!/amossh\n__builtin__\n");
+        fs_add_file(fs, bpath, bcontent);
+        int bi = fs_find(fs, bpath);
+        if (bi >= 0) {
+            strcpy(fs->nodes[bi].perms, "rwxr-xr-x");
+            strcpy(fs->nodes[bi].owner, "root");
+        }
+    }
+
+    fs_add_file(fs, "/home/user/hello.amos",
+        "#!/amossh\n"
+        "echo Script greeting:\n"
+        "echo $@\n");
+    int hi = fs_find(fs, "/home/user/hello.amos");
+    if (hi >= 0) {
+        strcpy(fs->nodes[hi].perms, "rwxr-xr-x");
+        strcpy(fs->nodes[hi].owner, "user");
+    }
 }
 
 /* ─── Process Table ───────────────────────────────────────────────────────── */
@@ -440,16 +605,29 @@ static int proc_tick(ProcessTable *pt) {
 /* ─── OZ Ledger ───────────────────────────────────────────────────────────── */
 static void ledger_init(OZLedger *l) { memset(l, 0, sizeof(OZLedger)); }
 
-static void ledger_record(OZLedger *l, const char *cmd, const char *actor, int tick, int result) {
+static void ledger_record_ex(OZLedger *l, const char *cmd, const char *pcmd, const char *pargs,
+                             const char *actor, int tick, int result, const char *explanation,
+                             int reversible, const char *undo_path, const char *undo_content,
+                             int undo_is_dir, int undo_was_create) {
     if (l->count >= MAX_LEDGER) return;
     LedgerEntry *e = &l->entries[l->count++];
     strncpy(e->command, cmd, MAX_CMD_LEN-1);
+    strncpy(e->parsed_cmd, pcmd ? pcmd : "", 31);
+    strncpy(e->parsed_args, pargs ? pargs : "", 255);
     strncpy(e->actor, actor, 15);
     e->tick = tick;
     e->timestamp = time(NULL);
     e->result_code = result;
-    snprintf(e->explanation, 127, "Executed: %s", cmd);
-    e->reversible = 0;
+    snprintf(e->explanation, 127, "%s", explanation ? explanation : "executed");
+    e->reversible = reversible;
+    if (undo_path) strncpy(e->undo_path, undo_path, MAX_PATH-1);
+    if (undo_content) strncpy(e->undo_content, undo_content, MAX_CONTENT-1);
+    e->undo_is_dir = undo_is_dir;
+    e->undo_was_create = undo_was_create;
+}
+
+static void ledger_record(OZLedger *l, const char *cmd, const char *actor, int tick, int result) {
+    ledger_record_ex(l, cmd, "", "", actor, tick, result, "Executed", 0, NULL, NULL, 0, 0);
 }
 
 /* ─── Module System ───────────────────────────────────────────────────────── */
@@ -558,6 +736,29 @@ static int unload_module(const char *name) {
     return ERR_NOT_FOUND;
 }
 
+static int slot_is_occupied(const char *slot_name) {
+    int si = find_slot(slot_name);
+    if (si < 0) return 0;
+    return K.slots[si].occupant_count > 0;
+}
+
+static int validate_module_contracts(void) {
+    for (int i = 0; i < K.module_count; i++) {
+        if (!K.modules[i].loaded) continue;
+        for (int j = 0; j < K.modules[i].requires_count; j++) {
+            const char *req = K.modules[i].contract_requires[j];
+            if (!slot_is_occupied(req)) return ERR_MODULE;
+        }
+    }
+    return ERR_OK;
+}
+
+static int fire_hook(const char *hook_name) {
+    int hi = find_hook(hook_name);
+    if (hi < 0) return 0;
+    return K.hooks[hi].sub_count;
+}
+
 static void init_builtin_modules(void) {
     { const char *c[]={"uptime"}; const char *s[]={"shell.commands"};
       const char *h[]={NULL}; const char *p[]={"uptime"}; const char *r[]={NULL};
@@ -649,6 +850,100 @@ static void kernel_init(void) {
 
     proc_spawn(&K.procs, "init");
     proc_spawn(&K.procs, "amossh");
+
+    K.hook_boot_fired = fire_hook("boot");
+    K.hook_sched_fired = 0;
+    proc_refresh_all();
+    (void)validate_module_contracts();
+}
+
+/* ─── Syscall Layer ───────────────────────────────────────────────────────── */
+static int kernel_syscall(const char *op, char *out, int outsz, int argc, char **argv) {
+    out[0] = '\0';
+    if (!op) return ERR_INVALID;
+
+    if (strcmp(op, "read") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        char resolved[MAX_PATH];
+        fs_resolve(&K.fs, argv[0], resolved);
+        if (proc_is_virtual(resolved)) proc_refresh_all();
+        int idx = fs_find(&K.fs, resolved);
+        if (idx < 0 || K.fs.nodes[idx].is_dir) return ERR_NOT_FOUND;
+        if (fs_access(&K.fs.nodes[idx], K.user, 'r') != ERR_OK) return ERR_PERMISSION;
+        snprintf(out, outsz, "%s", K.fs.nodes[idx].content);
+        return ERR_OK;
+    }
+    if (strcmp(op, "write") == 0) {
+        if (argc < 2) return ERR_INVALID;
+        char resolved[MAX_PATH];
+        fs_resolve(&K.fs, argv[0], resolved);
+        int idx = fs_find(&K.fs, resolved);
+        if (idx >= 0 && fs_access(&K.fs.nodes[idx], K.user, 'w') != ERR_OK) return ERR_PERMISSION;
+        char content[MAX_CONTENT] = "";
+        for (int i = 1; i < argc; i++) {
+            if (i > 1) strncat(content, " ", MAX_CONTENT - strlen(content) - 1);
+            strncat(content, argv[i], MAX_CONTENT - strlen(content) - 1);
+        }
+        fs_add_file(&K.fs, resolved, content);
+        return ERR_OK;
+    }
+    if (strcmp(op, "stat") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        char resolved[MAX_PATH];
+        fs_resolve(&K.fs, argv[0], resolved);
+        if (proc_is_virtual(resolved)) proc_refresh_all();
+        int idx = fs_find(&K.fs, resolved);
+        if (idx < 0) return ERR_NOT_FOUND;
+        FSNode *n = &K.fs.nodes[idx];
+        snprintf(out, outsz, "path=%s type=%s perms=%s owner=%s size=%d",
+            n->path, n->is_dir ? "dir" : "file", n->perms, n->owner,
+            n->is_dir ? 0 : (int)strlen(n->content));
+        return ERR_OK;
+    }
+    if (strcmp(op, "getcwd") == 0) {
+        snprintf(out, outsz, "%s", K.fs.cwd);
+        return ERR_OK;
+    }
+    if (strcmp(op, "chdir") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        char resolved[MAX_PATH];
+        fs_resolve(&K.fs, argv[0], resolved);
+        int idx = fs_find(&K.fs, resolved);
+        if (idx < 0 || !K.fs.nodes[idx].is_dir) return ERR_NOT_FOUND;
+        if (fs_access(&K.fs.nodes[idx], K.user, 'x') != ERR_OK) return ERR_PERMISSION;
+        strcpy(K.fs.cwd, resolved);
+        return ERR_OK;
+    }
+    if (strcmp(op, "alloc") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        int size = atoi(argv[0]);
+        int bid = mem_alloc(&K.mem, size, K.user, "rw-");
+        if (bid < 0) return ERR_NO_MEMORY;
+        snprintf(out, outsz, "%d", bid);
+        return ERR_OK;
+    }
+    if (strcmp(op, "free") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        return mem_free(&K.mem, atoi(argv[0]));
+    }
+    if (strcmp(op, "spawn") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        int pid = proc_spawn(&K.procs, argv[0]);
+        if (pid < 0) return ERR_NO_MEMORY;
+        snprintf(out, outsz, "%d", pid);
+        return ERR_OK;
+    }
+    if (strcmp(op, "kill") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        return proc_kill(&K.procs, atoi(argv[0]));
+    }
+    if (strcmp(op, "getenv") == 0) {
+        if (argc < 1) return ERR_INVALID;
+        const char *v = env_get(argv[0]);
+        snprintf(out, outsz, "%s", v ? v : "");
+        return ERR_OK;
+    }
+    return ERR_NOT_FOUND;
 }
 
 /* ─── Command Implementations ─────────────────────────────────────────────── */
@@ -658,10 +953,11 @@ static int cmd_help(char *out, int sz, int argc, char **argv) {
         "amosOZ commands:\n"
         "  alloc append boot call cat cd chmod clear contracts cp date\n"
         "  devices echo env exit fortune free help history hooks hw\n"
-        "  kill load loadmod ls mem mkdir mmap modules mv overhead\n"
-        "  oz ps pwd replay rm rmdir run save selftest set slots\n"
-        "  stat status tick touch trace tree uname unloadmod unset\n"
-        "  version write");
+        "  exec fortune free help history hooks hw kill load loadmod ls mem\n"
+        "  mkdir mmap modules motd mv overhead oz ps pwd replay rm rmdir\n"
+        "  run save selftest set slots syscall stat status tick touch trace\n"
+        "  tree undo uname unloadmod unset version which whoami write\n"
+        "  Shell: > >> |  Scripts: #!/amossh .amos  PATH:/bin");
     return ERR_OK;
 }
 
@@ -780,7 +1076,9 @@ static int cmd_kill(char *out, int sz, int argc, char **argv) {
 
 static int cmd_tick(char *out, int sz, int argc, char **argv) {
     int t = proc_tick(&K.procs);
-    snprintf(out, sz, "Tick: %d", t);
+    K.hook_sched_fired += fire_hook("sched");
+    proc_refresh_all();
+    snprintf(out, sz, "Tick: %d (sched hooks: %d)", t, K.hook_sched_fired);
     return ERR_OK;
 }
 
@@ -805,16 +1103,12 @@ static int cmd_pwd(char *out, int sz, int argc, char **argv) {
 
 static int cmd_cd(char *out, int sz, int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : "/home/user";
-    char resolved[MAX_PATH];
-    fs_resolve(&K.fs, path, resolved);
-    int idx = fs_find(&K.fs, resolved);
-    if (idx < 0 || !K.fs.nodes[idx].is_dir) {
-        snprintf(out, sz, "cd: no such directory: %s", path);
-        return ERR_NOT_FOUND;
-    }
-    strcpy(K.fs.cwd, resolved);
-    out[0] = '\0';
-    return ERR_OK;
+    char *a[] = {(char *)path};
+    int err = kernel_syscall("chdir", out, sz, 1, a);
+    if (err == ERR_PERMISSION) snprintf(out, sz, "cd: %s: Permission denied", path);
+    else if (err == ERR_NOT_FOUND) snprintf(out, sz, "cd: no such directory: %s", path);
+    else out[0] = '\0';
+    return err;
 }
 
 static int cmd_ls(char *out, int sz, int argc, char **argv) {
@@ -847,16 +1141,18 @@ static int cmd_ls(char *out, int sz, int argc, char **argv) {
 }
 
 static int cmd_cat(char *out, int sz, int argc, char **argv) {
-    if (argc < 2) { snprintf(out, sz, "Usage: cat <file>"); return ERR_INVALID; }
-    char resolved[MAX_PATH];
-    fs_resolve(&K.fs, argv[1], resolved);
-    int idx = fs_find(&K.fs, resolved);
-    if (idx < 0 || K.fs.nodes[idx].is_dir) {
-        snprintf(out, sz, "cat: %s: not found or not a file", argv[1]);
-        return ERR_NOT_FOUND;
+    if (argc < 2) {
+        if (shell_stdin_len > 0) {
+            snprintf(out, sz, "%s", shell_stdin_buf);
+            return ERR_OK;
+        }
+        snprintf(out, sz, "Usage: cat <file>");
+        return ERR_INVALID;
     }
-    snprintf(out, sz, "%s", K.fs.nodes[idx].content);
-    return ERR_OK;
+    int err = kernel_syscall("read", out, sz, 1, &argv[1]);
+    if (err == ERR_PERMISSION) snprintf(out, sz, "cat: %s: Permission denied", argv[1]);
+    else if (err == ERR_NOT_FOUND) snprintf(out, sz, "cat: %s: not found or not a file", argv[1]);
+    return err;
 }
 
 static int cmd_touch(char *out, int sz, int argc, char **argv) {
@@ -874,14 +1170,24 @@ static int cmd_write(char *out, int sz, int argc, char **argv) {
     if (argc < 3) { snprintf(out, sz, "Usage: write <file> <content...>"); return ERR_INVALID; }
     char resolved[MAX_PATH];
     fs_resolve(&K.fs, argv[1], resolved);
-    char content[MAX_CONTENT] = "";
-    for (int i = 2; i < argc; i++) {
-        if (i > 2) strcat(content, " ");
-        strncat(content, argv[i], MAX_CONTENT - strlen(content) - 1);
+    int idx = fs_find(&K.fs, resolved);
+    char old_content[MAX_CONTENT] = "";
+    int was_create = (idx < 0);
+    if (idx >= 0) {
+        if (fs_access(&K.fs.nodes[idx], K.user, 'w') != ERR_OK) {
+            snprintf(out, sz, "write: %s: Permission denied", argv[1]);
+            return ERR_PERMISSION;
+        }
+        strncpy(old_content, K.fs.nodes[idx].content, MAX_CONTENT-1);
     }
-    fs_add_file(&K.fs, resolved, content);
+    char *wargv[32];
+    int wargc = argc - 1;
+    for (int i = 0; i < wargc; i++) wargv[i] = argv[i + 1];
+    int err = kernel_syscall("write", out, sz, wargc, wargv);
+    if (err == ERR_OK)
+        ledger_meta_set(1, "fs write", resolved, old_content, 0, was_create);
     out[0] = '\0';
-    return ERR_OK;
+    return err;
 }
 
 static int cmd_append(char *out, int sz, int argc, char **argv) {
@@ -892,6 +1198,10 @@ static int cmd_append(char *out, int sz, int argc, char **argv) {
     if (idx < 0 || K.fs.nodes[idx].is_dir) {
         snprintf(out, sz, "append: %s not found", argv[1]);
         return ERR_NOT_FOUND;
+    }
+    if (fs_access(&K.fs.nodes[idx], K.user, 'w') != ERR_OK) {
+        snprintf(out, sz, "append: %s: Permission denied", argv[1]);
+        return ERR_PERMISSION;
     }
     for (int i = 2; i < argc; i++) {
         if (i > 2) strncat(K.fs.nodes[idx].content, " ", MAX_CONTENT - strlen(K.fs.nodes[idx].content) - 1);
@@ -911,7 +1221,14 @@ static int cmd_rm(char *out, int sz, int argc, char **argv) {
         snprintf(out, sz, "rm: cannot remove %s", argv[1]);
         return ERR_NOT_FOUND;
     }
+    if (fs_access(&K.fs.nodes[idx], K.user, 'w') != ERR_OK) {
+        snprintf(out, sz, "rm: %s: Permission denied", argv[1]);
+        return ERR_PERMISSION;
+    }
+    char backup[MAX_CONTENT];
+    strncpy(backup, K.fs.nodes[idx].content, MAX_CONTENT-1);
     K.fs.nodes[idx].used = 0;
+    ledger_meta_set(1, "fs delete", resolved, backup, 0, 0);
     out[0] = '\0';
     return ERR_OK;
 }
@@ -1167,7 +1484,12 @@ static int cmd_contracts(char *out, int sz, int argc, char **argv) {
 }
 
 static int cmd_loadmod(char *out, int sz, int argc, char **argv) {
-    snprintf(out, sz, "loadmod: dynamic loading not supported in this version (modules are compiled-in)");
+    if (validate_module_contracts() != ERR_OK) {
+        snprintf(out, sz, "loadmod: contract validation failed (missing required slots)");
+        return ERR_MODULE;
+    }
+    snprintf(out, sz, "loadmod: dynamic loading not supported in v%s (modules compiled-in; contracts OK)",
+        VERSION);
     return ERR_OK;
 }
 
@@ -1209,10 +1531,53 @@ static int cmd_replay(char *out, int sz, int argc, char **argv) {
     int n = 0;
     if (K.ledger.count == 0) { snprintf(out, sz, "(no replay data)"); return ERR_OK; }
     n = safe_append(out, n, sz, "Replay Log:\n");
-    for (int i = 0; i < K.ledger.count; i++)
-        n = safe_append(out, n, sz, "  tick=%d cmd=%s result=%d\n",
-            K.ledger.entries[i].tick, K.ledger.entries[i].command, K.ledger.entries[i].result_code);
+    for (int i = 0; i < K.ledger.count; i++) {
+        LedgerEntry *e = &K.ledger.entries[i];
+        n = safe_append(out, n, sz, "  tick=%d cmd=%s parsed=%s args=%s result=%d rev=%d\n",
+            e->tick, e->command, e->parsed_cmd, e->parsed_args, e->result_code, e->reversible);
+    }
     return ERR_OK;
+}
+
+static int cmd_undo(char *out, int sz, int argc, char **argv) {
+    for (int i = K.ledger.count - 1; i >= 0; i--) {
+        LedgerEntry *e = &K.ledger.entries[i];
+        if (!e->reversible || e->result_code != ERR_OK) continue;
+        if (e->undo_was_create) {
+            int idx = fs_find(&K.fs, e->undo_path);
+            if (idx >= 0) K.fs.nodes[idx].used = 0;
+        } else if (e->undo_is_dir) {
+            fs_add_dir(&K.fs, e->undo_path);
+        } else {
+            fs_add_file(&K.fs, e->undo_path, e->undo_content);
+        }
+        e->reversible = 0;
+        snprintf(out, sz, "Undid: %s (%s)", e->parsed_cmd, e->undo_path);
+        return ERR_OK;
+    }
+    snprintf(out, sz, "undo: nothing reversible in ledger");
+    return ERR_NOT_FOUND;
+}
+
+static int cmd_whoami(char *out, int sz, int argc, char **argv) {
+    snprintf(out, sz, "%s", K.user);
+    return ERR_OK;
+}
+
+static int cmd_motd(char *out, int sz, int argc, char **argv) {
+    char buf[MAX_CONTENT];
+    int err = kernel_syscall("read", buf, sizeof(buf), 1, (char *[]) {"/etc/motd"});
+    if (err != ERR_OK) snprintf(out, sz, "%s", MOTD);
+    else snprintf(out, sz, "%s", buf);
+    return ERR_OK;
+}
+
+static int cmd_syscall(char *out, int sz, int argc, char **argv) {
+    if (argc < 2) {
+        snprintf(out, sz, "Usage: syscall <op> [args...]\nOps: read write stat getcwd chdir alloc free spawn kill getenv");
+        return ERR_INVALID;
+    }
+    return kernel_syscall(argv[1], out, sz, argc - 2, argv + 2);
 }
 
 static int cmd_reset(char *out, int sz, int argc, char **argv) {
@@ -1275,7 +1640,7 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
 
     CHECK("boot_state", K.boot_time > 0);
     CHECK("hw_profile", strlen(K.hw.platform) > 0);
-    CHECK("version", strcmp(VERSION, "0.1.0") == 0);
+    CHECK("version", strcmp(VERSION, "0.3.0") == 0);
 
     /* Filesystem */
     fs_add_file(&K.fs, "/tmp/selftest_file", "hello");
@@ -1296,8 +1661,27 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
     fs_add_file(&K.fs, "/tmp/ptest", "data");
     int pi = fs_find(&K.fs, "/tmp/ptest");
     strcpy(K.fs.nodes[pi].perms, "r--------");
+    strcpy(K.fs.nodes[pi].owner, "root");
     CHECK("permission_mutation", strcmp(K.fs.nodes[pi].perms, "r--------") == 0);
+    CHECK("permission_enforced", fs_access(&K.fs.nodes[pi], "user", 'w') == ERR_PERMISSION);
     K.fs.nodes[pi].used = 0;
+
+    /* Virtual /proc + os-release */
+    proc_refresh_all();
+    int proc_idx = fs_find(&K.fs, "/proc/uptime");
+    CHECK("proc_uptime", proc_idx >= 0 && strchr(K.fs.nodes[proc_idx].content, '.') != NULL);
+    int os_idx = fs_find(&K.fs, "/etc/os-release");
+    CHECK("os_release", os_idx >= 0 && strstr(K.fs.nodes[os_idx].content, "ID=amosoz") != NULL);
+
+    /* Syscall layer */
+    char scbuf[512];
+    char *scargv[] = {"/etc/hostname"};
+    CHECK("syscall_read", kernel_syscall("read", scbuf, sizeof(scbuf), 1, scargv) == ERR_OK
+        && strstr(scbuf, "amosoz") != NULL);
+
+    /* Hooks + contracts */
+    CHECK("hook_boot_fired", K.hook_boot_fired > 0);
+    CHECK("contract_validation", validate_module_contracts() == ERR_OK);
 
     /* Memory */
     int bid = mem_alloc(&K.mem, 100, "selftest", "rw-");
@@ -1341,6 +1725,33 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
 
     /* Ledger */
     CHECK("oz_ledger", K.ledger.count > 0);
+    int parsed_ok = 0;
+    for (int i = 0; i < K.ledger.count; i++)
+        if (K.ledger.entries[i].parsed_cmd[0]) parsed_ok = 1;
+    CHECK("ledger_parsed", parsed_ok);
+
+    /* Undo path */
+    dispatch("write /tmp/undo_me undo_payload", tmp, sizeof(tmp));
+    dispatch("undo", tmp, sizeof(tmp));
+    int undo_idx = fs_find(&K.fs, "/tmp/undo_me");
+    CHECK("ledger_undo", strstr(tmp, "Undid") != NULL || undo_idx < 0);
+
+    /* Phase 2: shell treaty */
+    dispatch("echo treaty_redir > /tmp/shell_redir", tmp, sizeof(tmp));
+    int sri = fs_find(&K.fs, "/tmp/shell_redir");
+    CHECK("shell_redirect", sri >= 0 && strstr(K.fs.nodes[sri].content, "treaty_redir") != NULL);
+
+    dispatch("echo appended >> /tmp/shell_redir", tmp, sizeof(tmp));
+    CHECK("shell_append", sri >= 0 && strstr(K.fs.nodes[sri].content, "appended") != NULL);
+
+    dispatch("echo pipe_token | cat", tmp, sizeof(tmp));
+    CHECK("shell_pipe", strstr(tmp, "pipe_token") != NULL);
+
+    dispatch("which echo", tmp, sizeof(tmp));
+    CHECK("path_which", strstr(tmp, "/bin/echo") != NULL);
+
+    dispatch("exec /home/user/hello.amos resonance", tmp, sizeof(tmp));
+    CHECK("script_exec", strstr(tmp, "Script greeting") != NULL && strstr(tmp, "resonance") != NULL);
 
     /* Summary */
     char header[64];
@@ -1358,10 +1769,353 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
     return ERR_OK;
 }
 
-/* ─── Command Dispatcher ──────────────────────────────────────────────────── */
-typedef int (*CmdFunc)(char*, int, int, char**);
-typedef struct { const char *name; CmdFunc func; } CmdEntry;
+/* ─── Shell Layer (redirects, pipes, PATH, scripts) ───────────────────────── */
+static void str_trim_inplace(char *s) {
+    if (!s) return;
+    int len = (int)strlen(s);
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t')) s[--len] = '\0';
+    char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+}
 
+static int is_script_node(int idx) {
+    if (idx < 0) return 0;
+    FSNode *n = &K.fs.nodes[idx];
+    if (n->is_dir) return 0;
+    if (strstr(n->path, ".amos")) return 1;
+    return strncmp(n->content, "#!/amossh", 9) == 0;
+}
+
+static int path_lookup_executable(const char *name, char *resolved_out) {
+    char resolved[MAX_PATH];
+    if (strchr(name, '/')) {
+        fs_resolve(&K.fs, name, resolved);
+        int idx = fs_find(&K.fs, resolved);
+        if (idx < 0 || K.fs.nodes[idx].is_dir) return -1;
+        if (fs_access(&K.fs.nodes[idx], K.user, 'x') != ERR_OK) return -1;
+        strcpy(resolved_out, resolved);
+        return idx;
+    }
+    const char *pathenv = env_get("PATH");
+    if (!pathenv) pathenv = "/bin:/usr/bin";
+    char paths[256];
+    strncpy(paths, pathenv, sizeof(paths) - 1);
+    paths[sizeof(paths) - 1] = '\0';
+    char *save = NULL;
+    for (char *dir = strtok_r(paths, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+        snprintf(resolved, sizeof(resolved), "%s/%s", dir, name);
+        int idx = fs_find(&K.fs, resolved);
+        if (idx >= 0 && !K.fs.nodes[idx].is_dir &&
+            fs_access(&K.fs.nodes[idx], K.user, 'x') == ERR_OK) {
+            strcpy(resolved_out, resolved);
+            return idx;
+        }
+    }
+    return -1;
+}
+
+static void expand_script_vars(const char *in, int argc, char **argv, char *out, int outsz) {
+    int o = 0;
+    for (int i = 0; in[i] && o < outsz - 1; i++) {
+        if (in[i] == '$') {
+            if (in[i + 1] == '@') {
+                for (int a = 1; a < argc && o < outsz - 1; a++) {
+                    if (a > 1) out[o++] = ' ';
+                    const char *s = argv[a];
+                    while (*s && o < outsz - 1) out[o++] = *s++;
+                }
+                i++;
+                continue;
+            }
+            if (in[i + 1] >= '1' && in[i + 1] <= '9') {
+                int an = in[i + 1] - '0';
+                if (an < argc) {
+                    const char *s = argv[an];
+                    while (*s && o < outsz - 1) out[o++] = *s++;
+                }
+                i++;
+                continue;
+            }
+        }
+        out[o++] = in[i];
+    }
+    out[o] = '\0';
+}
+
+static int shell_redirect_write(const char *path, const char *data, int append) {
+    char resolved[MAX_PATH];
+    fs_resolve(&K.fs, path, resolved);
+    str_trim_inplace(resolved);
+    int idx = fs_find(&K.fs, resolved);
+    if (idx >= 0) {
+        if (fs_access(&K.fs.nodes[idx], K.user, 'w') != ERR_OK) return ERR_PERMISSION;
+        if (append) {
+            strncat(K.fs.nodes[idx].content, data, MAX_CONTENT - strlen(K.fs.nodes[idx].content) - 1);
+            if (data[0] && data[strlen(data) - 1] != '\n')
+                strncat(K.fs.nodes[idx].content, "\n", MAX_CONTENT - strlen(K.fs.nodes[idx].content) - 1);
+        } else {
+            strncpy(K.fs.nodes[idx].content, data, MAX_CONTENT - 1);
+            K.fs.nodes[idx].content[MAX_CONTENT - 1] = '\0';
+        }
+        K.fs.nodes[idx].modified = time(NULL);
+        return ERR_OK;
+    }
+    fs_add_file(&K.fs, resolved, data);
+    return ERR_OK;
+}
+
+static void shell_parse_redirect(char *seg, char *redir_path, int *append) {
+    redir_path[0] = '\0';
+    *append = 0;
+    char *p = strstr(seg, ">>");
+    if (p) {
+        *p = '\0';
+        *append = 1;
+        str_trim_inplace(seg);
+        strncpy(redir_path, p + 2, MAX_PATH - 1);
+        str_trim_inplace(redir_path);
+        return;
+    }
+    p = strchr(seg, '>');
+    if (p) {
+        *p = '\0';
+        str_trim_inplace(seg);
+        strncpy(redir_path, p + 1, MAX_PATH - 1);
+        str_trim_inplace(redir_path);
+    }
+}
+
+static int run_script_node(int idx, int argc, char **argv, char *output, int outsize) {
+    if (shell_depth >= MAX_SCRIPT_DEPTH) {
+        snprintf(output, outsize, "script: max nesting depth exceeded");
+        return ERR_INVALID;
+    }
+    shell_depth++;
+    FSNode *n = &K.fs.nodes[idx];
+    output[0] = '\0';
+
+    if (strstr(n->content, "__builtin__")) {
+        const char *base = strrchr(n->path, '/');
+        const char *cmd = base ? base + 1 : n->path;
+        char *new_argv[32];
+        int new_argc = argc > 1 ? argc - 1 : 1;
+        new_argv[0] = (char *)cmd;
+        for (int i = 1; i < argc; i++) new_argv[i] = argv[i];
+        if (argc <= 1) new_argc = 1;
+        int err = dispatch_argv(NULL, new_argc, new_argv, output, outsize);
+        shell_depth--;
+        return err;
+    }
+
+    char body[MAX_CONTENT];
+    strncpy(body, n->content, MAX_CONTENT - 1);
+    body[MAX_CONTENT - 1] = '\0';
+    char *start = body;
+    if (strncmp(start, "#!", 2) == 0) {
+        char *nl = strchr(start, '\n');
+        start = nl ? nl + 1 : start + strlen(start);
+    }
+
+    int outpos = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(start, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        str_trim_inplace(line);
+        if (!line[0] || line[0] == '#') continue;
+        char expanded[MAX_CMD_LEN];
+        expand_script_vars(line, argc, argv, expanded, sizeof(expanded));
+        char segbuf[MAX_CMD_LEN];
+        strncpy(segbuf, expanded, MAX_CMD_LEN - 1);
+        segbuf[MAX_CMD_LEN - 1] = '\0';
+        char *sargv[32];
+        int sargc = 0;
+        char *ssave = NULL;
+        for (char *tok = strtok_r(segbuf, " \t", &ssave); tok && sargc < 32;
+             tok = strtok_r(NULL, " \t", &ssave))
+            sargv[sargc++] = tok;
+        char segout[4096];
+        int err = dispatch_argv(expanded, sargc, sargv, segout, sizeof(segout));
+        if (err != ERR_OK && segout[0]) {
+            outpos = safe_append(output, outpos, outsize, "%s%s", outpos ? "\n" : "", segout);
+            shell_depth--;
+            return err;
+        }
+        if (segout[0])
+            outpos = safe_append(output, outpos, outsize, "%s%s", outpos ? "\n" : "", segout);
+    }
+    shell_depth--;
+    return ERR_OK;
+}
+
+static int dispatch_argv(const char *line, int argc, char **argv, char *output, int outsize) {
+    output[0] = '\0';
+    if (!argv || argc <= 0 || !argv[0] || !argv[0][0]) return ERR_OK;
+
+    char pargs[256] = "";
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) strncat(pargs, " ", sizeof(pargs) - strlen(pargs) - 1);
+        strncat(pargs, argv[i], sizeof(pargs) - strlen(pargs) - 1);
+    }
+
+    ledger_meta_clear();
+    (void)fire_hook("ai");
+
+    if (strcmp(argv[0], "exit") == 0) {
+        K.running = 0;
+        snprintf(output, outsize, "Shutting down amosOZ.");
+        ledger_record_ex(&K.ledger, line ? line : "exit", "exit", pargs, K.user,
+            K.procs.tick_count, ERR_OK, "shutdown", 0, NULL, NULL, 0, 0);
+        return ERR_OK;
+    }
+
+    for (int i = 0; CMD_TABLE[i].name; i++) {
+        if (strcmp(argv[0], CMD_TABLE[i].name) == 0) {
+            int result = CMD_TABLE[i].func(output, outsize, argc, argv);
+            if (pending_ledger.active) {
+                ledger_record_ex(&K.ledger, line ? line : argv[0], argv[0], pargs, K.user,
+                    K.procs.tick_count, result, pending_ledger.explanation,
+                    pending_ledger.reversible, pending_ledger.undo_path,
+                    pending_ledger.undo_content, pending_ledger.undo_is_dir,
+                    pending_ledger.undo_was_create);
+                ledger_meta_clear();
+            } else {
+                ledger_record_ex(&K.ledger, line ? line : argv[0], argv[0], pargs, K.user,
+                    K.procs.tick_count, result, "Executed", 0, NULL, NULL, 0, 0);
+            }
+            return result;
+        }
+    }
+
+    char resolved[MAX_PATH];
+    int idx = path_lookup_executable(argv[0], resolved);
+    if (idx >= 0 && is_script_node(idx)) {
+        int result = run_script_node(idx, argc, argv, output, outsize);
+        ledger_record_ex(&K.ledger, line ? line : argv[0], argv[0], pargs, K.user,
+            K.procs.tick_count, result, "script exec", 0, NULL, NULL, 0, 0);
+        return result;
+    }
+
+    snprintf(output, outsize, "amosoz: command not found: %s", argv[0]);
+    ledger_record_ex(&K.ledger, line ? line : argv[0], argv[0], pargs, K.user,
+        K.procs.tick_count, ERR_NOT_FOUND, "not found", 0, NULL, NULL, 0, 0);
+    return ERR_NOT_FOUND;
+}
+
+static int shell_execute_segment(const char *seg, const char *line, char *output, int outsize) {
+    char work[MAX_CMD_LEN];
+    char redir[MAX_PATH];
+    int append = 0;
+    strncpy(work, seg, MAX_CMD_LEN - 1);
+    work[MAX_CMD_LEN - 1] = '\0';
+    shell_parse_redirect(work, redir, &append);
+
+    char buf[MAX_CMD_LEN];
+    strncpy(buf, work, MAX_CMD_LEN - 1);
+    buf[MAX_CMD_LEN - 1] = '\0';
+    char *argv[32];
+    int argc = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, " \t", &save); tok && argc < 32;
+         tok = strtok_r(NULL, " \t", &save))
+        argv[argc++] = tok;
+
+    int err = dispatch_argv(line ? line : work, argc, argv, output, outsize);
+
+    if (redir[0]) {
+        if (err == ERR_OK) {
+            int werr = shell_redirect_write(redir, output, append);
+            if (werr == ERR_PERMISSION)
+                snprintf(output, outsize, "amosoz: %s: Permission denied", redir);
+            else if (werr != ERR_OK)
+                snprintf(output, outsize, "amosoz: redirect to %s failed", redir);
+            else
+                output[0] = '\0';
+            return werr != ERR_OK ? werr : ERR_OK;
+        }
+    }
+    return err;
+}
+
+static int shell_execute_line(const char *line, char *output, int outsize) {
+    output[0] = '\0';
+    char pipe_parts[8][MAX_CMD_LEN];
+    int nparts = 0;
+    char tmp[MAX_CMD_LEN];
+    strncpy(tmp, line, MAX_CMD_LEN - 1);
+    tmp[MAX_CMD_LEN - 1] = '\0';
+
+    char *save = NULL;
+    char *seg = tmp;
+    for (char *p = tmp; *p && nparts < 8; p++) {
+        if (*p == '|') {
+            *p = '\0';
+            str_trim_inplace(seg);
+            if (seg[0]) strncpy(pipe_parts[nparts++], seg, MAX_CMD_LEN - 1);
+            seg = p + 1;
+        }
+    }
+    str_trim_inplace(seg);
+    if (seg[0]) strncpy(pipe_parts[nparts++], seg, MAX_CMD_LEN - 1);
+    if (nparts == 0) return ERR_OK;
+
+    char pipe_buf[MAX_CONTENT];
+    pipe_buf[0] = '\0';
+    int last_err = ERR_OK;
+
+    for (int i = 0; i < nparts; i++) {
+        if (i > 0) {
+            shell_stdin_len = (int)strlen(pipe_buf);
+            strncpy(shell_stdin_buf, pipe_buf, MAX_CONTENT - 1);
+            shell_stdin_buf[MAX_CONTENT - 1] = '\0';
+        } else {
+            shell_stdin_len = 0;
+            shell_stdin_buf[0] = '\0';
+        }
+
+        char segout[8192];
+        last_err = shell_execute_segment(pipe_parts[i], line, segout, sizeof(segout));
+
+        if (i < nparts - 1) {
+            strncpy(pipe_buf, segout, MAX_CONTENT - 1);
+            pipe_buf[MAX_CONTENT - 1] = '\0';
+        } else {
+            strncpy(output, segout, outsize - 1);
+            output[outsize - 1] = '\0';
+        }
+        if (last_err != ERR_OK) break;
+    }
+    shell_stdin_len = 0;
+    return last_err;
+}
+
+static int cmd_which(char *out, int sz, int argc, char **argv) {
+    if (argc < 2) { snprintf(out, sz, "Usage: which <name>"); return ERR_INVALID; }
+    char resolved[MAX_PATH];
+    int idx = path_lookup_executable(argv[1], resolved);
+    if (idx < 0) {
+        snprintf(out, sz, "which: %s: not found", argv[1]);
+        return ERR_NOT_FOUND;
+    }
+    snprintf(out, sz, "%s", resolved);
+    return ERR_OK;
+}
+
+static int cmd_exec(char *out, int sz, int argc, char **argv) {
+    if (argc < 2) { snprintf(out, sz, "Usage: exec <path> [args...]"); return ERR_INVALID; }
+    char resolved[MAX_PATH];
+    int idx = path_lookup_executable(argv[1], resolved);
+    if (idx < 0) {
+        snprintf(out, sz, "exec: %s: not found", argv[1]);
+        return ERR_NOT_FOUND;
+    }
+    if (!is_script_node(idx)) {
+        snprintf(out, sz, "exec: %s: not a script", argv[1]);
+        return ERR_INVALID;
+    }
+    return run_script_node(idx, argc, argv, out, sz);
+}
+
+/* ─── Command Dispatcher ──────────────────────────────────────────────────── */
 static const CmdEntry CMD_TABLE[] = {
     {"help", cmd_help}, {"clear", cmd_clear}, {"uname", cmd_uname},
     {"version", cmd_version}, {"boot", cmd_boot}, {"hw", cmd_hw},
@@ -1379,7 +2133,10 @@ static const CmdEntry CMD_TABLE[] = {
     {"oz", cmd_oz}, {"slots", cmd_slots}, {"modules", cmd_modules},
     {"overhead", cmd_overhead}, {"hooks", cmd_hooks}, {"contracts", cmd_contracts},
     {"loadmod", cmd_loadmod}, {"unloadmod", cmd_unloadmod}, {"call", cmd_call},
-    {"trace", cmd_trace}, {"replay", cmd_replay}, {"reset", cmd_reset},
+    {"trace", cmd_trace}, {"replay", cmd_replay}, {"undo", cmd_undo},
+    {"whoami", cmd_whoami}, {"motd", cmd_motd}, {"syscall", cmd_syscall},
+    {"which", cmd_which}, {"exec", cmd_exec},
+    {"reset", cmd_reset},
     {"save", cmd_save}, {"load", cmd_load}, {"fortune", cmd_fortune},
     {NULL, NULL}
 };
@@ -1387,46 +2144,15 @@ static const CmdEntry CMD_TABLE[] = {
 static int dispatch(const char *line, char *output, int outsize) {
     output[0] = '\0';
     if (!line || !line[0]) return ERR_OK;
-
-    /* Save to history */
     if (K.history_count < MAX_HISTORY)
-        strncpy(K.history[K.history_count++], line, MAX_CMD_LEN-1);
-
-    /* Parse */
-    char buf[MAX_CMD_LEN];
-    strncpy(buf, line, MAX_CMD_LEN-1); buf[MAX_CMD_LEN-1] = '\0';
-    char *argv[32];
-    int argc = 0;
-    char *tok = strtok(buf, " \t");
-    while (tok && argc < 32) { argv[argc++] = tok; tok = strtok(NULL, " \t"); }
-    if (argc == 0) return ERR_OK;
-
-    /* Find command */
-    for (int i = 0; CMD_TABLE[i].name; i++) {
-        if (strcmp(argv[0], CMD_TABLE[i].name) == 0) {
-            int result = CMD_TABLE[i].func(output, outsize, argc, argv);
-            ledger_record(&K.ledger, line, K.user, K.procs.tick_count, result);
-            return result;
-        }
-    }
-
-    /* Check exit */
-    if (strcmp(argv[0], "exit") == 0) {
-        K.running = 0;
-        snprintf(output, outsize, "Shutting down amosOZ.");
-        return ERR_OK;
-    }
-
-    snprintf(output, outsize, "amosoz: command not found: %s", argv[0]);
-    ledger_record(&K.ledger, line, K.user, K.procs.tick_count, ERR_NOT_FOUND);
-    return ERR_NOT_FOUND;
+        strncpy(K.history[K.history_count++], line, MAX_CMD_LEN - 1);
+    return shell_execute_line(line, output, outsize);
 }
 
 /* ─── Main ────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
     kernel_init();
-    printf("%s v%s\n", SYSTEM_NAME, VERSION);
-    printf("Type 'help' for commands, 'selftest' to verify, 'exit' to quit.\n\n");
+    printf("%s", MOTD);
 
     char line[MAX_CMD_LEN];
     char output[8192];
