@@ -1,4 +1,4 @@
-# amosOZ — Arianna Method Operating System
+# amos.oz — Arianna Method Operating System
 
 **The most atomic way to build a working OS-like environment from scratch.**
 
