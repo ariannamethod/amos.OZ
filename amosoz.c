@@ -33,7 +33,7 @@ static inline int safe_append(char *buf, int offset, int bufsz, const char *fmt,
     return offset;
 }
 
-#define MAX_PATH 256
+#define MAX_PATH 512
 #define MAX_CONTENT 4096
 #define MAX_FILES 512
 #define MAX_BLOCKS 256
@@ -560,22 +560,22 @@ static int unload_module(const char *name) {
 
 static void init_builtin_modules(void) {
     { const char *c[]={"uptime"}; const char *s[]={"shell.commands"};
-      const char *h[]={}; const char *p[]={"uptime"}; const char *r[]={};
+      const char *h[]={NULL}; const char *p[]={"uptime"}; const char *r[]={NULL};
       register_module("coreutils","Core utilities",c,1,s,1,h,0,p,1,r,0,"0.1"); }
     { const char *c[]={"hwinfo"}; const char *s[]={"diagnostics"};
-      const char *h[]={"boot"}; const char *p[]={"hwinfo"}; const char *r[]={};
+      const char *h[]={"boot"}; const char *p[]={"hwinfo"}; const char *r[]={NULL};
       register_module("hwprobe","Hardware probe",c,1,s,1,h,1,p,1,r,0,"0.1"); }
     { const char *c[]={"diag_status"}; const char *s[]={"diagnostics"};
-      const char *h[]={"diag"}; const char *p[]={"diag_status"}; const char *r[]={};
+      const char *h[]={"diag"}; const char *p[]={"diag_status"}; const char *r[]={NULL};
       register_module("diag","Diagnostics",c,1,s,1,h,1,p,1,r,0,"0.1"); }
     { const char *c[]={"ai_status"}; const char *s[]={"ai.hooks"};
       const char *h[]={"ai"}; const char *p[]={"ai_status","intent_hints"}; const char *r[]={"oz.ledger"};
       register_module("ai_seed","AI seed hooks",c,1,s,1,h,1,p,2,r,1,"0.1"); }
     { const char *c[]={"ledger_size"}; const char *s[]={"oz.ledger","oz.contracts"};
-      const char *h[]={"ai"}; const char *p[]={"ledger_size","trace","replay"}; const char *r[]={};
+      const char *h[]={"ai"}; const char *p[]={"ledger_size","trace","replay"}; const char *r[]={NULL};
       register_module("oz_ledger","OZ Ledger provenance",c,1,s,2,h,1,p,3,r,0,"0.1"); }
     { const char *c[]={"fortune"}; const char *s[]={"shell.commands","experiments"};
-      const char *h[]={"experiment"}; const char *p[]={"fortune"}; const char *r[]={};
+      const char *h[]={"experiment"}; const char *p[]={"fortune"}; const char *r[]={NULL};
       register_module("fortune_ext","Example extension: fortune",c,1,s,2,h,1,p,1,r,0,"0.1"); }
 }
 
