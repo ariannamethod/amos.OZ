@@ -5,7 +5,7 @@
 amosOZ is a single-file OS environment in three forms: C, HTML/JS, Python. Not Linux — but **treaty-compatible** with Unix userland semantics.
 
 **Canonical:** `amosoz.c` **v0.4.0** — reference implementation (llm.c-grade for OS).  
-**Parity:** `amosoz.py` + `amosoz.html` lag behind; sync planned after C stabilizes.
+**Parity:** `amosoz.py` + `amosoz.html` **v0.4.0** — triple parity complete (43/43 selftest each).
 
 Dedicated to **Amos Oz** (עוז). Resonance layer (θ, agents, export report) starts after v0.4.
 
@@ -15,8 +15,11 @@ Dedicated to **Amos Oz** (עוז). Resonance layer (θ, agents, export report) s
 make && make test-all && ./amosoz
 ```
 
-- `make test` — 43 internal selftest checks  
-- `make test-shell` — shell treaty + reference commands smoke  
+- `make test` — C 43/43 selftest  
+- `make test-py` — Python 43/43 selftest  
+- `make test-html` — headless HTML/JS 43/43 (`tests/html_selftest.mjs`)  
+- `make test-parity` — all three in one shot  
+- `make test-shell` — shell treaty smoke (C)  
 - `spec` / `doctor` — inside the shell
 
 ## Shell Treaty
@@ -71,16 +74,15 @@ Covers v0.3 treaty + v0.4 tiers: grep, head, wc, test, ln, find, export, fortune
 | File | Version | Status |
 |------|---------|--------|
 | `amosoz.c` | 0.4.0 | **canonical reference** |
-| `amosoz.py` | 0.1.x | needs sync |
-| `amosoz.html` | 0.1.x | needs sync |
+| `amosoz.py` | 0.4.0 | ✅ parity (43/43) |
+| `amosoz.html` | 0.4.0 | ✅ parity (43/43) |
 
-Triple-file parity = same selftest + shell_treaty passing on all three. C leads; py/html follow.
+Triple-file parity = same selftest names + shell treaty on all three. C leads; py/html follow.
 
 ## Roadmap
 
-- **v0.4** ✅ C reference tiers A–E  
-- **v0.4.1** py/html parity (optional “угореть” sprint)  
-- **v0.5** Resonance: θ, actors, `export report`, AML runtime hooks  
+- **v0.4** ✅ C reference tiers A–E + triple parity  
+- **v0.5** Resonance (C-first): θ, actors, `export report`, AML runtime hooks  
 
 ## Design Principles
 

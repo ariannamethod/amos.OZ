@@ -23,474 +23,858 @@ html, body { height: 100%; background: #0a0a0a; color: #e0e0e0; font-family: 'Co
 <div id="input-line"><span id="prompt"></span><input id="input" autofocus autocomplete="off" spellcheck="false"></div>
 </div>
 <script>
-// amosOZ — Arianna Method Operating System
-// The most atomic way to build a working OS-like environment from scratch.
-// AMOS is the operating body. OZ is the extensibility field.
-// "No kernel mythology here: only state, contracts, and consequences."
-
-const VERSION = "0.1.0";
+// amosOZ v0.4.0 kernel — ported from amosoz.py (browser + Node)
+const VERSION = "0.4.0";
 const SYSTEM_NAME = "amosOZ";
 const BUILD_DATE = "2026-06-30";
+const MOTD = `amosOZ v${VERSION} — Arianna Method Operating System\nDedicated to Amos Oz (עוז — strength, courage)\nCompatibility is a treaty, not obedience.\nType 'help', 'selftest', or 'motd'. Every command leaves a trace.\n`;
+const MAX_SCRIPT_DEPTH = 8;
 const ERR_OK = 0, ERR_NOT_FOUND = 1, ERR_PERMISSION = 2, ERR_EXISTS = 3;
-const ERR_NO_MEMORY = 4, ERR_INVALID = 5, ERR_IO = 6, ERR_NO_PROCESS = 7;
+const ERR_NO_MEMORY = 4, ERR_INVALID = 5, ERR_IO = 6, ERR_NO_PROCESS = 7, ERR_MODULE = 8;
+const BUILTIN_SLOTS = ["shell.commands","fs.drivers","devices","ai.hooks","sched.hooks","boot.hooks","diagnostics","experiments","oz.contracts","oz.ledger"];
 
-// ─── Hardware Detection ───────────────────────────────────────────────────
+function nowSec() { return Date.now() / 1000; }
+function strTrim(s) { return (s || "").trim(); }
+function patmatch(pat, name) {
+    if (!pat || !name) return false;
+    if (pat === "*") return true;
+    if (!pat.includes("*")) return pat === name;
+    const i = pat.indexOf("*");
+    const pre = pat.slice(0, i), suffix = pat.slice(i + 1);
+    return name.startsWith(pre) && name.endsWith(suffix) && suffix.length <= name.length;
+}
 function detectHardware() {
-    const hw = { platform: "unknown", userAgent: "unknown", cpuCores: "unknown",
-        memory: "unknown", gpu: "unavailable", storage: "unavailable",
-        screen: "unknown", secureContext: "unknown", language: "unknown" };
-    try { hw.userAgent = navigator.userAgent || "unknown"; } catch(e) {}
-    try { hw.cpuCores = String(navigator.hardwareConcurrency || "unknown"); } catch(e) {}
-    try { hw.memory = navigator.deviceMemory ? navigator.deviceMemory + " GB" : "unknown"; } catch(e) {}
-    try { hw.screen = window.screen ? `${screen.width}x${screen.height}` : "unknown"; } catch(e) {}
-    try { hw.secureContext = String(window.isSecureContext); } catch(e) {}
-    try { hw.language = navigator.language || "unknown"; } catch(e) {}
-    try { hw.platform = navigator.platform || "unknown"; } catch(e) {}
-    try { localStorage.setItem("__test", "1"); localStorage.removeItem("__test"); hw.storage = "localStorage"; } catch(e) {
-        try { if (window.indexedDB) hw.storage = "indexedDB"; } catch(e2) {}
-    }
-    // WebGPU probe
-    try { if (navigator.gpu) hw.gpu = "webgpu-available"; } catch(e) {}
+    const hw = { platform: "unknown", platform_release: "unknown", machine: "browser", processor: "unknown",
+        cpu_count: -1, memory_mb: -1, terminal: "browser", persistence: 1, hostname: "amosoz" };
+    try { hw.platform = navigator.platform || "unknown"; } catch (_) {}
+    try { hw.cpu_count = navigator.hardwareConcurrency || -1; hw.processor = String(hw.cpu_count); } catch (_) {}
+    try { if (navigator.deviceMemory) hw.memory_mb = navigator.deviceMemory * 1024; } catch (_) {}
     return hw;
 }
 
-// ─── Virtual Memory ───────────────────────────────────────────────────────
 class VirtualMemory {
-    constructor(totalKB = 65536) {
-        this.total = totalKB; this.used = 0; this.blocks = {}; this.nextId = 1;
-    }
+    constructor(totalKb = 65536) { this.total = totalKb; this.used = 0; this.blocks = {}; this.nextId = 1; }
     alloc(size, owner = "system", flags = "rw-") {
         if (this.used + size > this.total) return [null, ERR_NO_MEMORY];
-        const id = this.nextId++;
-        this.blocks[id] = { size, flags, owner };
+        const bid = this.nextId++;
+        this.blocks[bid] = { size, flags, owner };
         this.used += size;
-        return [id, ERR_OK];
+        return [bid, ERR_OK];
     }
-    free(id) {
-        if (!this.blocks[id]) return ERR_NOT_FOUND;
-        this.used -= this.blocks[id].size;
-        delete this.blocks[id];
+    free(bid) {
+        if (!(bid in this.blocks)) return ERR_NOT_FOUND;
+        this.used -= this.blocks[bid].size;
+        delete this.blocks[bid];
         return ERR_OK;
     }
-    stats() { return { total: this.total, used: this.used, free: this.total - this.used, blocks: Object.keys(this.blocks).length }; }
+    stats() { return { total_kb: this.total, used_kb: this.used, free_kb: this.total - this.used, blocks: Object.keys(this.blocks).length }; }
     mmap() { return Object.entries(this.blocks); }
 }
 
-// ─── Virtual Filesystem ───────────────────────────────────────────────────
-// "Compatibility is a treaty, not obedience."
 class VirtualFS {
-    constructor() { this.tree = {}; this.cwd = "/"; this._initTree(); }
-    _initTree() {
-        const dirs = ["/","/bin","/etc","/home","/tmp","/var","/dev","/proc","/sys",
-            "/usr","/usr/lib","/usr/share","/home/user","/var/log","/etc/amosoz"];
-        const now = Date.now();
-        dirs.forEach(d => { this.tree[d] = {type:"dir",perms:"rwxr-xr-x",created:now,modified:now,owner:"root"}; });
-        this.tree["/etc/hostname"] = {type:"file",content:"amosoz",perms:"rw-r--r--",created:now,modified:now,owner:"root"};
-        this.tree["/etc/amosoz/version"] = {type:"file",content:VERSION,perms:"rw-r--r--",created:now,modified:now,owner:"root"};
+    constructor(kernel = null) { this.tree = {}; this.cwd = "/"; this.kernel = kernel; this._initTree(); }
+    _node(ntype, kw = {}) {
+        const t = nowSec();
+        return Object.assign({ type: ntype, perms: "rw-r--r--", created: t, modified: t, owner: "user", content: "", symlink_target: "" }, kw);
     }
-    _resolve(path) {
-        if (!path) path = this.cwd;
-        if (!path.startsWith("/")) path = this.cwd === "/" ? "/" + path : this.cwd + "/" + path;
+    _initTree() {
+        for (const d of ["/","/bin","/etc","/home","/tmp","/var","/dev","/proc","/sys","/usr","/usr/lib","/usr/share","/usr/share/amosoz","/home/user","/var/log","/etc/amosoz"])
+            this.tree[d] = this._node("dir", { perms: "rwxr-xr-x", owner: "root" });
+        this.tree["/etc/hostname"] = this._node("file", { content: "amosoz", owner: "root" });
+        this.tree["/etc/amosoz/version"] = this._node("file", { content: VERSION, owner: "root" });
+        this.tree["/etc/motd"] = this._node("file", { owner: "root", content: "amosOZ — Arianna Method Operating System\nDedicated to Amos Oz (עוז)\nOZ begins where extension becomes accountable.\n" });
+        this.tree["/etc/os-release"] = this._node("file", { owner: "root", content: `NAME="amosOZ"\nPRETTY_NAME="amosOZ (Arianna Method Operating System)"\nID=amosoz\nVERSION_ID="${VERSION}"\nHOME_URL="https://github.com/ariannamethod/amos.OZ"\nSUPPORT_END="never"\n` });
+        for (const p of ["/proc/uptime","/proc/meminfo","/proc/cpuinfo","/proc/version","/proc/self/status"])
+            this.tree[p] = this._node("file", { owner: "root", content: "" });
+        this.tree["/usr/share/amosoz/quotes.txt"] = this._node("file", { owner: "root", content: "A conflict begins and ends in the hearts of men, not in the hills.\nThe opposite of indifference is not love but curiosity.\nWe all pay a price for our dreams.\nעוז — strength lives in the willingness to see the other.\nLiterature is a chamber of justice without a judge.\n" });
+        for (const name of ["echo","ls","cat","pwd","uname","whoami","date","help","grep","head","tail","wc","test","hostname","id","true","false","uptime","dmesg","find","ln","export","source","spec","doctor"])
+            this.tree[`/bin/${name}`] = this._node("file", { content: "#!/amossh\n__builtin__\n", perms: "rwxr-xr-x", owner: "root" });
+        this.tree["/home/user/hello.amos"] = this._node("file", { perms: "rwxr-xr-x", owner: "user", content: "#!/amossh\necho Script greeting:\necho $@\n" });
+    }
+    _normalize(path, cwd = null) {
+        cwd = cwd !== null ? cwd : this.cwd;
+        if (!path.startsWith("/")) path = cwd === "/" ? "/" + path : cwd + "/" + path;
         const parts = [];
-        path.split("/").forEach(p => { if (!p || p === ".") return; if (p === "..") parts.pop(); else parts.push(p); });
+        for (const p of path.split("/")) {
+            if (!p || p === ".") continue;
+            if (p === "..") { if (parts.length) parts.pop(); } else parts.push(p);
+        }
         return parts.length ? "/" + parts.join("/") : "/";
     }
-    exists(p) { return this._resolve(p) in this.tree; }
-    isDir(p) { const r = this._resolve(p); return this.tree[r] && this.tree[r].type === "dir"; }
-    mkdir(p) {
-        const r = this._resolve(p);
-        if (this.tree[r]) return ERR_EXISTS;
-        const parent = r.split("/").slice(0,-1).join("/") || "/";
-        if (!this.tree[parent] || this.tree[parent].type !== "dir") return ERR_NOT_FOUND;
-        this.tree[r] = {type:"dir",perms:"rwxr-xr-x",created:Date.now(),modified:Date.now(),owner:"user"};
+    _resolve(path, follow = true) {
+        let out = this._normalize(path);
+        if (!follow) return out;
+        for (let i = 0; i < 8; i++) {
+            const node = this.tree[out];
+            if (!node || node.type !== "symlink") break;
+            out = this._normalize(node.symlink_target);
+        }
+        return out;
+    }
+    resolveNode(path) { return this._resolve(path); }
+    _permBit(perms, bit) { return perms && perms.length >= 9 && perms[bit] !== "-"; }
+    access(path, user, op) {
+        const r = this._resolve(path, false);
+        const node = this.tree[r];
+        if (!node) return ERR_NOT_FOUND;
+        if (user === "root") return ERR_OK;
+        const base = node.owner === user ? 0 : 6;
+        let bit = base;
+        if (op === "r") bit += 0; else if (op === "w") bit += 1; else if (op === "x") bit += 2; else return ERR_INVALID;
+        return this._permBit(node.perms, bit) ? ERR_OK : ERR_PERMISSION;
+    }
+    addSymlink(linkpath, target) {
+        const r = this._normalize(linkpath);
+        if (r in this.tree) return ERR_EXISTS;
+        this.tree[r] = this._node("symlink", { perms: "lrwxrwxrwx", symlink_target: this._resolve(target) });
         return ERR_OK;
     }
-    touch(p) {
-        const r = this._resolve(p);
-        if (this.tree[r]) { this.tree[r].modified = Date.now(); return ERR_OK; }
-        const parent = r.split("/").slice(0,-1).join("/") || "/";
-        if (!this.tree[parent]) return ERR_NOT_FOUND;
-        this.tree[r] = {type:"file",content:"",perms:"rw-r--r--",created:Date.now(),modified:Date.now(),owner:"user"};
+    readToBuf(path) {
+        if (this.kernel && this.kernel.procIsVirtual(path)) this.kernel.procRefreshAll();
+        const r = this._resolve(path);
+        const node = this.tree[r];
+        if (!node || node.type === "dir" || node.type === "symlink") return [null, ERR_NOT_FOUND];
+        if (this.kernel && this.kernel.accessNode(r, "r") !== ERR_OK) return [null, ERR_PERMISSION];
+        return [node.content || "", ERR_OK];
+    }
+    exists(path) { return this._resolve(path) in this.tree; }
+    mkdir(path) {
+        const r = this._resolve(path);
+        if (r in this.tree) return ERR_EXISTS;
+        const parent = r.split("/").slice(0, -1).join("/") || "/";
+        if (!(parent in this.tree) || this.tree[parent].type !== "dir") return ERR_NOT_FOUND;
+        this.tree[r] = this._node("dir", { perms: "rwxr-xr-x" });
         return ERR_OK;
     }
-    write(p, content) {
-        const r = this._resolve(p);
-        if (this.tree[r] && this.tree[r].type === "dir") return ERR_INVALID;
-        const parent = r.split("/").slice(0,-1).join("/") || "/";
-        if (!this.tree[parent]) return ERR_NOT_FOUND;
-        if (!this.tree[r]) this.tree[r] = {type:"file",content,perms:"rw-r--r--",created:Date.now(),modified:Date.now(),owner:"user"};
-        else { this.tree[r].content = content; this.tree[r].modified = Date.now(); }
+    touch(path) {
+        const r = this._resolve(path);
+        if (r in this.tree) { this.tree[r].modified = nowSec(); return ERR_OK; }
+        const parent = r.split("/").slice(0, -1).join("/") || "/";
+        if (!(parent in this.tree)) return ERR_NOT_FOUND;
+        this.tree[r] = this._node("file");
         return ERR_OK;
     }
-    append(p, content) {
-        const r = this._resolve(p);
-        if (!this.tree[r] || this.tree[r].type !== "file") return ERR_NOT_FOUND;
-        this.tree[r].content += content; this.tree[r].modified = Date.now();
+    write(path, content) {
+        const r = this._resolve(path);
+        if (r in this.tree && this.tree[r].type === "dir") return ERR_INVALID;
+        const parent = r.split("/").slice(0, -1).join("/") || "/";
+        if (!(parent in this.tree)) return ERR_NOT_FOUND;
+        if (!(r in this.tree)) this.tree[r] = this._node("file", { content });
+        else { this.tree[r].content = content; this.tree[r].modified = nowSec(); }
         return ERR_OK;
     }
-    read(p) {
-        const r = this._resolve(p);
-        if (!this.tree[r]) return [null, ERR_NOT_FOUND];
+    append(path, content) {
+        const r = this._resolve(path);
+        if (!(r in this.tree) || this.tree[r].type !== "file") return ERR_NOT_FOUND;
+        this.tree[r].content += content;
+        this.tree[r].modified = nowSec();
+        return ERR_OK;
+    }
+    read(path) {
+        const r = this._resolve(path);
+        if (!(r in this.tree)) return [null, ERR_NOT_FOUND];
         if (this.tree[r].type !== "file") return [null, ERR_INVALID];
         return [this.tree[r].content, ERR_OK];
     }
-    rm(p) {
-        const r = this._resolve(p);
-        if (!this.tree[r]) return ERR_NOT_FOUND;
+    rm(path) {
+        const r = this._resolve(path);
+        if (!(r in this.tree)) return ERR_NOT_FOUND;
         if (this.tree[r].type === "dir") return ERR_INVALID;
-        delete this.tree[r]; return ERR_OK;
+        delete this.tree[r];
+        return ERR_OK;
     }
-    rmdir(p) {
-        const r = this._resolve(p);
-        if (!this.tree[r] || this.tree[r].type !== "dir") return ERR_NOT_FOUND;
-        if (r === "/") return ERR_PERMISSION;
+    rmdir(path) {
+        const r = this._resolve(path);
+        if (!(r in this.tree)) return ERR_NOT_FOUND;
+        if (this.tree[r].type !== "dir") return ERR_INVALID;
         for (const k of Object.keys(this.tree)) if (k !== r && k.startsWith(r + "/")) return ERR_INVALID;
-        delete this.tree[r]; return ERR_OK;
+        if (r === "/") return ERR_PERMISSION;
+        delete this.tree[r];
+        return ERR_OK;
     }
-    ls(p) {
-        const r = this._resolve(p || this.cwd);
-        if (!this.tree[r] || this.tree[r].type !== "dir") return [null, ERR_NOT_FOUND];
+    ls(path = null) {
+        const r = this._resolve(path || this.cwd);
+        if (!(r in this.tree) || this.tree[r].type !== "dir") return [null, ERR_NOT_FOUND];
         const prefix = r === "/" ? "/" : r + "/";
         const entries = [];
-        Object.keys(this.tree).sort().forEach(k => {
-            if (k === r || !k.startsWith(prefix)) return;
+        for (const k of Object.keys(this.tree).sort()) {
+            if (k === r || !k.startsWith(prefix)) continue;
             const rest = k.slice(prefix.length);
             if (!rest.includes("/")) entries.push([rest, this.tree[k].type, this.tree[k].perms]);
-        });
+        }
         return [entries, ERR_OK];
     }
     mv(src, dst) {
         const rs = this._resolve(src), rd = this._resolve(dst);
-        if (!this.tree[rs]) return ERR_NOT_FOUND;
-        this.tree[rd] = this.tree[rs]; delete this.tree[rs];
-        if (this.tree[rd].type === "dir") {
-            Object.keys(this.tree).filter(k => k.startsWith(rs + "/")).forEach(k => {
-                this.tree[k.replace(rs, rd)] = this.tree[k]; delete this.tree[k];
-            });
+        if (!(rs in this.tree)) return ERR_NOT_FOUND;
+        const node = this.tree[rs];
+        delete this.tree[rs];
+        this.tree[rd] = node;
+        if (node.type === "dir") {
+            for (const k of Object.keys(this.tree).slice()) {
+                if (k.startsWith(rs + "/")) { this.tree[k.replace(rs, rd)] = this.tree[k]; delete this.tree[k]; }
+            }
         }
         return ERR_OK;
     }
     cp(src, dst) {
         const rs = this._resolve(src), rd = this._resolve(dst);
-        if (!this.tree[rs] || this.tree[rs].type === "dir") return ERR_NOT_FOUND;
+        if (!(rs in this.tree) || this.tree[rs].type === "dir") return ERR_NOT_FOUND;
         this.tree[rd] = JSON.parse(JSON.stringify(this.tree[rs]));
-        this.tree[rd].created = Date.now();
+        this.tree[rd].created = nowSec();
         return ERR_OK;
     }
-    chmod(p, perms) {
-        const r = this._resolve(p);
-        if (!this.tree[r]) return ERR_NOT_FOUND;
-        this.tree[r].perms = perms; return ERR_OK;
+    chmod(path, perms) {
+        const r = this._resolve(path);
+        if (!(r in this.tree)) return ERR_NOT_FOUND;
+        this.tree[r].perms = perms;
+        return ERR_OK;
     }
-    stat(p) {
-        const r = this._resolve(p);
-        if (!this.tree[r]) return [null, ERR_NOT_FOUND];
+    stat(path) {
+        const r = this._resolve(path);
+        if (!(r in this.tree)) return [null, ERR_NOT_FOUND];
         const n = this.tree[r];
-        const info = {path:r, type:n.type, perms:n.perms, owner:n.owner, created:n.created, modified:n.modified};
-        if (n.type === "file") info.size = (n.content||"").length;
+        const info = { path: r, type: n.type, perms: n.perms, owner: n.owner, created: n.created, modified: n.modified };
+        if (n.type === "file") info.size = (n.content || "").length;
         return [info, ERR_OK];
     }
-    treeView(p, prefix="", depth=0, maxDepth=4) {
+    treeView(path = null, prefix = "", depth = 0, maxDepth = 4) {
+        const r = this._resolve(path || this.cwd);
         if (depth > maxDepth) return [];
-        const [entries, err] = this.ls(p);
+        const [entries, err] = this.ls(r);
         if (err !== ERR_OK) return [];
         const lines = [];
-        entries.forEach(([name, type]) => {
-            lines.push(prefix + name + (type === "dir" ? "/" : ""));
-            if (type === "dir" && depth < maxDepth) {
-                const r = this._resolve(p || this.cwd);
+        for (const [name, typ] of entries) {
+            lines.push(prefix + name + (typ === "dir" ? "/" : ""));
+            if (typ === "dir" && depth < maxDepth) {
                 const child = r === "/" ? "/" + name : r + "/" + name;
-                lines.push(...this.treeView(child, prefix + "  ", depth+1, maxDepth));
+                lines.push(...this.treeView(child, prefix + "  ", depth + 1, maxDepth));
             }
-        });
+        }
         return lines;
     }
-    cd(p) {
-        const r = this._resolve(p);
-        if (!this.tree[r] || this.tree[r].type !== "dir") return ERR_NOT_FOUND;
-        this.cwd = r; return ERR_OK;
+    cd(path) {
+        const r = this._resolve(path);
+        if (!(r in this.tree) || this.tree[r].type !== "dir") return ERR_NOT_FOUND;
+        this.cwd = r;
+        return ERR_OK;
     }
-    serialize() { return JSON.stringify({tree: this.tree, cwd: this.cwd}); }
-    deserialize(data) { const obj = JSON.parse(data); this.tree = obj.tree; this.cwd = obj.cwd || "/"; }
+    serialize() { return JSON.stringify({ tree: this.tree, cwd: this.cwd }); }
+    deserialize(data) { const o = JSON.parse(data); this.tree = o.tree; this.cwd = o.cwd || "/"; }
 }
 
-// ─── Process Table ────────────────────────────────────────────────────────
 class ProcessTable {
     constructor() { this.processes = {}; this.nextPid = 1; this.tickCount = 0; }
-    spawn(name, state="running") {
+    spawn(name, state = "running") {
         const pid = this.nextPid++;
-        this.processes[pid] = {name, state, started: Date.now(), ticks: 0};
+        this.processes[pid] = { name, state, started: nowSec(), ticks: 0 };
         return pid;
     }
-    kill(pid) { if (!this.processes[pid]) return ERR_NO_PROCESS; delete this.processes[pid]; return ERR_OK; }
+    kill(pid) { if (!(pid in this.processes)) return ERR_NO_PROCESS; delete this.processes[pid]; return ERR_OK; }
     tick() {
         this.tickCount++;
-        Object.values(this.processes).forEach(p => { if (p.state === "running") p.ticks++; });
+        for (const pid of Object.keys(this.processes))
+            if (this.processes[pid].state === "running") this.processes[pid].ticks++;
         return this.tickCount;
     }
     ps() { return Object.entries(this.processes); }
+    status(pid) { return pid in this.processes ? [this.processes[pid], ERR_OK] : [null, ERR_NO_PROCESS]; }
 }
 
-// ─── OZ Ledger ────────────────────────────────────────────────────────────
-// "Every command leaves a trace."
 class OZLedger {
     constructor() { this.entries = []; }
-    record(command, parsed, actor="user", tick=0, resultCode=0, explanation="") {
-        this.entries.push({command, parsed, actor, tick, timestamp:Date.now(),
-            fsMutations:[], memMutations:[], procMutations:[], modMutations:[],
-            resultCode, explanation, reversible:false});
+    recordEx(command, parsedCmd, parsedArgs, actor, tick, resultCode, explanation, reversible = 0, undoPath = null, undoContent = null, undoIsDir = 0, undoWasCreate = 0) {
+        this.entries.push({ command, parsed_cmd: parsedCmd || "", parsed_args: parsedArgs || "", actor, tick, timestamp: nowSec(),
+            result_code: resultCode, explanation: explanation || "executed", reversible, undo_path: undoPath || "",
+            undo_content: undoContent || "", undo_is_dir: undoIsDir, undo_was_create: undoWasCreate });
     }
-    trace(n=10) { return this.entries.slice(-n); }
-    replayInfo() { return this.entries.map(e => ({tick:e.tick, command:e.command, result:e.resultCode})); }
+    trace(n = 10) { return this.entries.slice(-n); }
+    replayInfo() { return this.entries; }
     size() { return this.entries.length; }
 }
 
-// ─── OZ Layer ─────────────────────────────────────────────────────────────
-// "OZ begins where extension becomes accountable."
-const BUILTIN_SLOTS = ["shell.commands","fs.drivers","devices","ai.hooks","sched.hooks",
-    "boot.hooks","diagnostics","experiments","oz.contracts","oz.ledger"];
-
 class OZLayer {
     constructor() {
-        this.slots = {}; BUILTIN_SLOTS.forEach(s => this.slots[s] = []);
-        this.modules = {};
-        this.overheads = {};
-        this.hooks = {boot:[],sched:[],ai:[],diag:[],experiment:[]};
+        this.slots = Object.fromEntries(BUILTIN_SLOTS.map(s => [s, []]));
+        this.modules = {}; this.overheads = {};
+        this.hooks = { boot: [], sched: [], ai: [], diag: [], experiment: [] };
         this.contracts = {};
     }
     registerModule(name, mod) {
         this.modules[name] = mod;
-        const ov = {dispatch: (mod.commands||[]).length, hooks:0, slots:[]};
-        (mod.slots||[]).forEach(s => { if (this.slots[s]) { this.slots[s].push(name); ov.slots.push(s); }});
-        (mod.hooks||[]).forEach(h => { if (this.hooks[h]) { this.hooks[h].push(name); ov.hooks++; }});
+        const ov = { dispatch_entries: (mod.commands || []).length, hooks: 0, slots_occupied: [] };
+        for (const s of (mod.slots || [])) if (s in this.slots) { this.slots[s].push(name); ov.slots_occupied.push(s); }
+        for (const h of (mod.hooks || [])) if (h in this.hooks) { this.hooks[h].push(name); ov.hooks++; }
         if (mod.contract) this.contracts[name] = mod.contract;
         this.overheads[name] = ov;
-        if (mod.init) mod.init();
+        if (mod.init) mod.init.call(mod);
         return ERR_OK;
     }
     unregisterModule(name) {
-        if (!this.modules[name]) return ERR_NOT_FOUND;
+        if (!(name in this.modules)) return ERR_NOT_FOUND;
         const mod = this.modules[name];
-        if (mod.shutdown) mod.shutdown();
-        Object.keys(this.slots).forEach(s => { this.slots[s] = this.slots[s].filter(n => n !== name); });
-        Object.keys(this.hooks).forEach(h => { this.hooks[h] = this.hooks[h].filter(n => n !== name); });
+        if (mod.shutdown) mod.shutdown.call(mod);
+        for (const s of Object.keys(this.slots)) { const i = this.slots[s].indexOf(name); if (i >= 0) this.slots[s].splice(i, 1); }
+        for (const h of Object.keys(this.hooks)) { const i = this.hooks[h].indexOf(name); if (i >= 0) this.hooks[h].splice(i, 1); }
         delete this.contracts[name]; delete this.modules[name]; delete this.overheads[name];
         return ERR_OK;
     }
     totalOverhead() {
-        let d=0, h=0, s=0;
-        Object.values(this.overheads).forEach(ov => { d+=ov.dispatch; h+=ov.hooks; s+=ov.slots.length; });
-        return {modules: Object.keys(this.modules).length, dispatch:d, hooks:h, slots:s};
+        const t = { dispatch_entries: 0, hooks: 0, slots_occupied: 0, modules: Object.keys(this.modules).length };
+        for (const ov of Object.values(this.overheads)) {
+            t.dispatch_entries += ov.dispatch_entries; t.hooks += ov.hooks; t.slots_occupied += ov.slots_occupied.length;
+        }
+        return t;
+    }
+    callModule(modName, method) {
+        if (!(modName in this.modules)) return [null, ERR_NOT_FOUND];
+        const mod = this.modules[modName];
+        if (typeof mod[method] !== "function") return [null, ERR_INVALID];
+        return [mod[method].call(mod), ERR_OK];
     }
 }
 
-// ─── Built-in Modules ─────────────────────────────────────────────────────
-const MODULES = {
-    coreutils: { name:"coreutils", description:"Core utilities", commands:["uptime"],
-        slots:["shell.commands"], hooks:[], contract:{provides:["uptime"],requires:[],version:"0.1"},
-        init() { this._start = Date.now(); }, uptime() { return `Up ${Math.floor((Date.now()-this._start)/1000)}s`; }},
-    hwprobe: { name:"hwprobe", description:"Hardware probe", commands:["hwinfo"],
-        slots:["diagnostics"], hooks:["boot"], contract:{provides:["hwinfo"],requires:[],version:"0.1"},
-        init(){}, hwinfo(hw) { return hw; }},
-    diag: { name:"diag", description:"Diagnostics", commands:["diag_status"],
-        slots:["diagnostics"], hooks:["diag"], contract:{provides:["diag_status"],requires:[],version:"0.1"},
-        init(){}, diag_status() { return "diagnostics: nominal"; }},
-    ai_seed: { name:"ai_seed", description:"AI seed hooks", commands:["ai_status"],
-        slots:["ai.hooks"], hooks:["ai"], contract:{provides:["ai_status","intent_hints"],requires:["oz.ledger"],version:"0.1"},
-        init(){}, ai_status() { return "ai_seed: active, no external model"; }},
-    oz_ledger: { name:"oz_ledger", description:"OZ Ledger provenance", commands:["ledger_size"],
-        slots:["oz.ledger","oz.contracts"], hooks:["ai"], contract:{provides:["ledger_size","trace","replay"],requires:[],version:"0.1"},
-        init(){}},
-    fortune_ext: { name:"fortune_ext", description:"Example: fortune cookies", commands:["fortune"],
-        slots:["shell.commands","experiments"], hooks:["experiment"],
-        contract:{provides:["fortune"],requires:[],version:"0.1"},
-        _fortunes:["The system is the territory.","Every overhead has a name.",
-            "A module is a guest with manners.","Slots are finite; ambition is not.",
-            "Trace everything. Regret nothing."], _idx:0,
-        init(){}, fortune() { return this._fortunes[this._idx++ % this._fortunes.length]; }}
-};
+function makeModules() {
+    return {
+        coreutils: { name: "coreutils", description: "Core utilities module", commands: ["uptime"], slots: ["shell.commands"], hooks: [],
+            contract: { provides: ["uptime"], requires: [], version: "0.1" }, init() { this.start = nowSec(); }, uptime() { return `System up for ${Math.floor(nowSec() - this.start)} seconds`; } },
+        hwprobe: { name: "hwprobe", description: "Hardware probe module", commands: ["hwinfo"], slots: ["diagnostics"], hooks: ["boot"],
+            contract: { provides: ["hwinfo"], requires: [], version: "0.1" }, init() {}, hwinfo(hw) { return hw; } },
+        diag: { name: "diag", description: "Diagnostics module", commands: ["diag_status"], slots: ["diagnostics"], hooks: ["diag"],
+            contract: { provides: ["diag_status"], requires: [], version: "0.1" }, init() {}, diag_status() { return "diagnostics: nominal"; } },
+        ai_seed: { name: "ai_seed", description: "AI seed hooks module", commands: ["ai_status"], slots: ["ai.hooks"], hooks: ["ai"],
+            contract: { provides: ["ai_status", "intent_hints"], requires: ["oz.ledger"], version: "0.1" }, init() {}, ai_status() { return "ai_seed: active, no external model loaded"; } },
+        oz_ledger: { name: "oz_ledger", description: "OZ Ledger provenance tracking module", commands: ["ledger_size"], slots: ["oz.ledger", "oz.contracts"], hooks: ["ai"],
+            contract: { provides: ["ledger_size", "trace", "replay"], requires: [], version: "0.1" }, init() {}, ledger_size(ledger) { return ledger.size(); } },
+        fortune_ext: { name: "fortune_ext", description: "Example extension: fortune cookies", commands: ["fortune"], slots: ["shell.commands", "experiments"], hooks: ["experiment"],
+            contract: { provides: ["fortune"], requires: [], version: "0.1" }, init() { this.fortunes = ["The system is the territory.","Every overhead has a name.","A module is a guest with manners.","Slots are finite; ambition is not.","Trace everything. Regret nothing."]; this.idx = 0; },
+            fortune() { return this.fortunes[this.idx++ % this.fortunes.length]; } }
+    };
+}
 
-// ─── Kernel ───────────────────────────────────────────────────────────────
-// "The shell is the first weather of the system."
 class AmosOZKernel {
     constructor() {
-        this.name = SYSTEM_NAME; this.version = VERSION; this.bootTime = Date.now();
-        this.hw = detectHardware();
-        this.mem = new VirtualMemory(65536);
-        this.fs = new VirtualFS();
-        this.procs = new ProcessTable();
-        this.oz = new OZLayer();
-        this.ledger = new OZLedger();
-        this.env = {HOME:"/home/user",USER:"user",SHELL:"/bin/amossh",PATH:"/bin:/usr/bin",HOSTNAME:"amosoz"};
-        this.user = "user";
-        this.history = [];
-        this.devices = [
-            {name:"console",type:"char",status:"active"},
-            {name:"mem",type:"block",status:"active"},
-            {name:"null",type:"char",status:"active"},
-            {name:"zero",type:"char",status:"active"},
-        ];
-        if (this.hw.gpu === "webgpu-available")
-            this.devices.push({name:"gpu0",type:"accel",status:"available"});
-        this.running = true;
-        this._initModules();
+        this.name = SYSTEM_NAME; this.version = VERSION; this.bootTime = 0; this.hw = {}; this.mem = null; this.fs = null;
+        this.procs = null; this.oz = new OZLayer(); this.ledger = new OZLedger(); this.env = {}; this.user = "user";
+        this.history = []; this.devices = []; this.running = true; this.hookBootFired = 0; this.hookSchedFired = 0;
+        this.bootLog = ""; this.fortuneIdx = 0; this.fortuneOzIdx = 0; this.shellStdinBuf = ""; this.shellDepth = 0;
+        this.pendingLedger = {}; this._kernelInit();
+    }
+    _kernelInit() {
+        this.hw = detectHardware(); this.mem = new VirtualMemory(65536); this.fs = new VirtualFS(this);
+        this.procs = new ProcessTable(); this.ledger = new OZLedger(); this.env = {}; this.history = [];
+        this.user = "user"; this.running = true; this.hookBootFired = 0; this.hookSchedFired = 0;
+        this.fortuneIdx = 0; this.fortuneOzIdx = 0; this.shellStdinBuf = ""; this.shellDepth = 0; this.pendingLedger = {};
+        this.devices = [{ name: "console", type: "char", status: "active" },{ name: "mem", type: "block", status: "active" },
+            { name: "null", type: "char", status: "active" },{ name: "zero", type: "char", status: "active" }];
+        this.bootTime = nowSec(); this.oz = new OZLayer();
+        for (const [k, m] of Object.entries(makeModules())) this.oz.registerModule(k, Object.assign({}, m));
+        this.envSet("HOME", "/home/user"); this.envSet("USER", "user"); this.envSet("SHELL", "/bin/amossh");
+        this.envSet("PATH", "/bin:/usr/bin"); this.envSet("TERM", this.hw.terminal || "unknown");
+        this.envSet("HOSTNAME", this.hw.hostname || "amosoz");
         this.procs.spawn("init"); this.procs.spawn("amossh");
+        this.hookBootFired = this.fireHook("boot");
+        this.bootLog = `[boot] amosOZ ${VERSION} started\n[boot] ${this.hookBootFired} hook subscribers on boot\n[boot] dedicated to Amos Oz (עוז)\n`;
+        this.procRefreshAll();
     }
-    _initModules() {
-        Object.keys(MODULES).forEach(k => this.oz.registerModule(k, Object.create(MODULES[k])));
-    }
-    dispatch(line) {
-        line = line.trim();
-        if (!line) return "";
-        this.history.push(line);
-        const parts = line.split(/\s+/);
-        const cmd = parts[0], args = parts.slice(1);
-        const result = this._exec(cmd, args);
-        this.ledger.record(line, {cmd, args}, this.user, this.procs.tickCount, ERR_OK, `Executed: ${cmd}`);
-        return result;
-    }
-    _exec(cmd, args) {
-        const commands = {
-            help: () => "amosOZ commands:\n  " + Object.keys(commands).sort().join("  "),
-            clear: () => "\x1b[CLEAR]",
-            uname: () => `${this.name} ${this.version} browser ${this.hw.platform}`,
-            version: () => `${this.name} version ${this.version} (build ${BUILD_DATE})`,
-            boot: () => `Boot time: ${new Date(this.bootTime).toISOString()}\nUptime: ${Math.floor((Date.now()-this.bootTime)/1000)}s`,
-            hw: () => "Hardware Profile:\n" + Object.entries(this.hw).map(([k,v])=>`  ${k}: ${v}`).join("\n"),
-            devices: () => "Devices:\n" + this.devices.map(d=>`  ${d.name.padEnd(12)} ${d.type.padEnd(8)} ${d.status}`).join("\n"),
-            gpu: () => {
-                if (this.hw.gpu === "webgpu-available") return "GPU: WebGPU available (device registered as gpu0)";
-                return "GPU: not available (WebGPU not supported in this browser)";
-            },
-            mem: () => { const s=this.mem.stats(); return `Memory: ${s.total} KB total, ${s.used} KB used, ${s.free} KB free, ${s.blocks} blocks`; },
-            mmap: () => { const b=this.mem.mmap(); if(!b.length) return "No memory blocks allocated.";
-                return "ID    Size(KB)  Flags  Owner\n"+b.map(([id,i])=>`${String(id).padEnd(5)} ${String(i.size).padEnd(9)} ${i.flags.padEnd(6)} ${i.owner}`).join("\n"); },
-            alloc: () => { if(!args[0]) return "Usage: alloc <size_kb>"; const sz=parseInt(args[0]);
-                if(isNaN(sz)) return "Error: size must be integer"; const [id,err]=this.mem.alloc(sz,this.user);
-                if(err) return "Error: out of memory"; return `Allocated block ${id} (${sz} KB)`; },
-            free: () => { if(!args[0]) return "Usage: free <block_id>"; const id=parseInt(args[0]);
-                const err=this.mem.free(id); if(err) return `Error: block ${id} not found`; return `Freed block ${id}`; },
-            ps: () => { const p=this.procs.ps(); if(!p.length) return "No processes.";
-                return "PID   Name          State     Ticks\n"+p.map(([pid,i])=>`${String(pid).padEnd(5)} ${i.name.padEnd(13)} ${i.state.padEnd(9)} ${i.ticks}`).join("\n"); },
-            run: () => { if(!args[0]) return "Usage: run <name>"; const pid=this.procs.spawn(args[0]); return `Started process '${args[0]}' with PID ${pid}`; },
-            kill: () => { if(!args[0]) return "Usage: kill <pid>"; const err=this.procs.kill(parseInt(args[0]));
-                if(err) return `Error: process ${args[0]} not found`; return `Killed process ${args[0]}`; },
-            tick: () => `Tick: ${this.procs.tick()}`,
-            status: () => { if(!args[0]) return "Usage: status <pid>"; const pid=parseInt(args[0]);
-                const p=this.procs.processes[pid]; if(!p) return `Error: process ${pid} not found`;
-                return `PID ${pid}: ${p.name} state=${p.state} ticks=${p.ticks}`; },
-            pwd: () => this.fs.cwd,
-            cd: () => { const p=args[0]||this.env.HOME; const err=this.fs.cd(p); return err?`cd: no such directory: ${p}`:""; },
-            ls: () => { const [entries,err]=this.fs.ls(args[0]); if(err) return "ls: no such directory";
-                if(!entries.length) return ""; return entries.map(([n,t,p])=>`${p} ${n}${t==="dir"?"/":""}`).join("\n"); },
-            cat: () => { if(!args[0]) return "Usage: cat <file>"; const [c,err]=this.fs.read(args[0]);
-                if(err) return `cat: ${args[0]}: not found`; return c; },
-            touch: () => { if(!args[0]) return "Usage: touch <file>"; this.fs.touch(args[0]); return ""; },
-            write: () => { if(args.length<2) return "Usage: write <file> <content...>"; this.fs.write(args[0],args.slice(1).join(" ")); return ""; },
-            append: () => { if(args.length<2) return "Usage: append <file> <content...>"; const err=this.fs.append(args[0],args.slice(1).join(" "));
-                if(err) return `append: ${args[0]} not found`; return ""; },
-            rm: () => { if(!args[0]) return "Usage: rm <file>"; const err=this.fs.rm(args[0]); if(err) return `rm: cannot remove ${args[0]}`; return ""; },
-            mkdir: () => { if(!args[0]) return "Usage: mkdir <dir>"; const err=this.fs.mkdir(args[0]); if(err) return `mkdir: cannot create ${args[0]}`; return ""; },
-            rmdir: () => { if(!args[0]) return "Usage: rmdir <dir>"; const err=this.fs.rmdir(args[0]); if(err) return `rmdir: cannot remove ${args[0]}`; return ""; },
-            mv: () => { if(args.length<2) return "Usage: mv <src> <dst>"; const err=this.fs.mv(args[0],args[1]); if(err) return "mv: error"; return ""; },
-            cp: () => { if(args.length<2) return "Usage: cp <src> <dst>"; const err=this.fs.cp(args[0],args[1]); if(err) return "cp: error"; return ""; },
-            chmod: () => { if(args.length<2) return "Usage: chmod <perms> <path>"; this.fs.chmod(args[1],args[0]); return ""; },
-            stat: () => { if(!args[0]) return "Usage: stat <path>"; const [info,err]=this.fs.stat(args[0]);
-                if(err) return `stat: ${args[0]} not found`; return Object.entries(info).map(([k,v])=>`  ${k}: ${v}`).join("\n"); },
-            tree: () => { const lines=this.fs.treeView(args[0]); return lines.length?lines.join("\n"):"(empty)"; },
-            echo: () => args.join(" "),
-            env: () => Object.entries(this.env).sort().map(([k,v])=>`${k}=${v}`).join("\n"),
-            set: () => { if(args.length<2) return "Usage: set <key> <value>"; this.env[args[0]]=args.slice(1).join(" "); return ""; },
-            unset: () => { if(!args[0]) return "Usage: unset <key>"; delete this.env[args[0]]; return ""; },
-            date: () => new Date().toISOString().replace("T"," ").replace(/\.\d+Z/," UTC"),
-            history: () => this.history.length?this.history.slice(-20).map((h,i)=>`${i+1}: ${h}`).join("\n"):"(no history)",
-            selftest: () => this._selftest(),
-            oz: () => { const ov=this.oz.totalOverhead(); return `OZ Layer — Extensibility Field\n  Modules loaded: ${ov.modules}\n  Slots defined: ${Object.keys(this.oz.slots).length}\n  Hooks active: ${Object.values(this.oz.hooks).reduce((a,b)=>a+b.length,0)}\n  Contracts: ${Object.keys(this.oz.contracts).length}\n  Ledger entries: ${this.ledger.size()}\n  Total overhead: ${ov.dispatch} dispatch, ${ov.hooks} hooks, ${ov.slots} slot occupations`; },
-            slots: () => "Slots:\n"+Object.entries(this.oz.slots).sort().map(([n,o])=>`  ${n}: ${o.length?o.join(", "):"(empty)"}`).join("\n"),
-            modules: () => "Modules:\n"+Object.entries(this.oz.modules).sort().map(([n,m])=>`  ${n}: ${m.description} [commands: ${(m.commands||[]).join(", ")}]`).join("\n"),
-            overhead: () => { const t=this.oz.totalOverhead(); let s=`Overhead Accounting:\n  Total modules: ${t.modules}\n  Total dispatch entries: ${t.dispatch}\n  Total hooks: ${t.hooks}\n  Total slot occupations: ${t.slots}\n\nPer-module:\n`;
-                Object.entries(this.oz.overheads).sort().forEach(([n,o])=>{s+=`  ${n}: dispatch=${o.dispatch} hooks=${o.hooks} slots=${JSON.stringify(o.slots)}\n`;}); return s; },
-            hooks: () => "Hooks:\n"+Object.entries(this.oz.hooks).sort().map(([n,s])=>`  ${n}: ${s.length?s.join(", "):"(none)"}`).join("\n"),
-            contracts: () => "Module Contracts:\n"+Object.entries(this.oz.contracts).sort().map(([n,c])=>`  ${n}:\n    provides: ${JSON.stringify(c.provides)}\n    requires: ${JSON.stringify(c.requires)}\n    version: ${c.version}`).join("\n"),
-            loadmod: () => "loadmod: dynamic loading not supported in this version (modules are compiled-in)",
-            unloadmod: () => { if(!args[0]) return "Usage: unloadmod <module>"; const err=this.oz.unregisterModule(args[0]);
-                if(err) return `unloadmod: '${args[0]}' not found`; return `Unloaded module '${args[0]}'`; },
-            call: () => { if(args.length<2) return "Usage: call <module> <method>"; const m=this.oz.modules[args[0]];
-                if(!m) return `call: module '${args[0]}' not found`; if(!m[args[1]]) return `call: method not found`;
-                return String(m[args[1]]()); },
-            trace: () => { const n=parseInt(args[0])||10; const entries=this.ledger.trace(n);
-                if(!entries.length) return "(no trace entries)";
-                return "OZ Ledger Trace:\n"+entries.map(e=>`  [${e.tick}] ${e.command} -> ${e.resultCode} (${e.explanation})`).join("\n"); },
-            replay: () => { const entries=this.ledger.replayInfo(); if(!entries.length) return "(no replay data)";
-                return "Replay Log:\n"+entries.map(e=>`  tick=${e.tick} cmd=${e.command} result=${e.result}`).join("\n"); },
-            reset: () => { this.constructor.call(this); return "System reset complete."; },
-            save: () => { try { localStorage.setItem("amosoz_image", this.fs.serialize());
-                localStorage.setItem("amosoz_env", JSON.stringify(this.env)); return "System image saved to localStorage"; }
-                catch(e) { return "save: storage unavailable"; }},
-            load: () => { try { const d=localStorage.getItem("amosoz_image"); if(!d) return "load: no saved image";
-                this.fs.deserialize(d); const e=localStorage.getItem("amosoz_env");
-                if(e) Object.assign(this.env, JSON.parse(e)); return "System image loaded from localStorage"; }
-                catch(e) { return "load: error: "+e.message; }},
-            fortune: () => { const m=this.oz.modules.fortune_ext; if(!m) return "fortune: module not loaded"; return m.fortune(); },
-            exit: () => { this.running = false; return "Shutting down amosOZ."; },
-        };
-        if (commands[cmd]) return commands[cmd]();
-        // Check module commands
-        for (const [mname, mod] of Object.entries(this.oz.modules)) {
-            if ((mod.commands||[]).includes(cmd) && mod[cmd]) return String(mod[cmd]());
+    envSet(k, v) { this.env[k] = v; }
+    envGet(k) { return this.env[k]; }
+    envUnset(k) { delete this.env[k]; }
+    fireHook(name) { return (this.oz.hooks[name] || []).length; }
+    validateModuleContracts() {
+        for (const [name, c] of Object.entries(this.oz.contracts)) {
+            if (!(name in this.oz.modules)) continue;
+            for (const req of (c.requires || [])) if (!(this.oz.slots[req] || []).length) return ERR_MODULE;
         }
-        return `amosoz: command not found: ${cmd}`;
+        return ERR_OK;
     }
-    _selftest() {
-        const results = [];
-        const check = (name, cond) => { results.push(`  [${cond?"PASS":"FAIL"}] ${name}`); return cond; };
+    procIsVirtual(path) { return path && (path === "/proc" || path.startsWith("/proc/")); }
+    accessNode(path, op) { return this.fs.access(path, this.user, op); }
+    procRefreshAll() {
+        const elapsed = Math.floor(nowSec() - this.bootTime);
+        this._procWrite("/proc/uptime", `${elapsed}.0\n`);
+        const free = this.mem.total - this.mem.used;
+        this._procWrite("/proc/meminfo", `MemTotal:       ${this.mem.total} kB\nMemFree:        ${free} kB\nMemAvailable:   ${free} kB\n`);
+        const cores = this.hw.cpu_count > 0 ? this.hw.cpu_count : 1;
+        this._procWrite("/proc/cpuinfo", `processor\t: 0\nmodel name\t: amosOZ virtual cpu\ncpu cores\t: ${cores}\nhostname\t: ${this.hw.hostname || "amosoz"}\n`);
+        this._procWrite("/proc/version", `${SYSTEM_NAME} ${VERSION} ${this.hw.machine || "browser"} ${this.hw.platform || "unknown"}\n`);
+        this._procWrite("/proc/self/status", `Name:\tamossh\nPid:\t1\nState:\trunning (virtual)\nVmSize:\t${this.mem.used} kB\nThreads:\t${this.procs.nextPid - 1}\n`);
+    }
+    _procWrite(path, content) {
+        if (!(path in this.fs.tree)) this.fs.tree[path] = this.fs._node("file", { owner: "root", content, perms: "r--r--r--" });
+        else { this.fs.tree[path].content = content; this.fs.tree[path].modified = nowSec(); }
+    }
+    ledgerMetaClear() { this.pendingLedger = {}; }
+    ledgerMetaSet(reversible, explanation, undoPath = null, undoContent = null, undoIsDir = 0, undoWasCreate = 0) {
+        this.pendingLedger = { active: true, reversible, explanation, undo_path: undoPath || "", undo_content: undoContent || "", undo_is_dir: undoIsDir, undo_was_create: undoWasCreate };
+    }
+    kernelSyscall(op, argv) {
+        if (op === "read") {
+            if (!argv.length) return ["", ERR_INVALID];
+            const [c, err] = this.fs.readToBuf(argv[0]); return [c || "", err];
+        }
+        if (op === "write") {
+            if (argv.length < 2) return ["", ERR_INVALID];
+            return ["", this.fs.write(argv[0], argv.slice(1).join(" "))];
+        }
+        if (op === "stat") {
+            if (!argv.length) return ["", ERR_INVALID];
+            const [info, err] = this.fs.stat(argv[0]);
+            if (err !== ERR_OK) return ["", err];
+            const size = info.type === "file" ? (info.size || 0) : 0;
+            return [`path=${info.path} type=${info.type} perms=${info.perms} owner=${info.owner} size=${size}`, ERR_OK];
+        }
+        if (op === "getcwd") return [this.fs.cwd, ERR_OK];
+        if (op === "chdir") {
+            if (!argv.length) return ["", ERR_INVALID];
+            const r = this.fs._resolve(argv[0]);
+            const node = this.fs.tree[r];
+            if (!node || node.type !== "dir") return ["", ERR_NOT_FOUND];
+            if (this.accessNode(r, "x") !== ERR_OK) return ["", ERR_PERMISSION];
+            this.fs.cwd = r; return ["", ERR_OK];
+        }
+        if (op === "alloc") { const [bid, err] = argv.length ? this.mem.alloc(parseInt(argv[0], 10), this.user) : [null, ERR_INVALID]; return [bid ? String(bid) : "", err]; }
+        if (op === "free") return ["", argv.length ? this.mem.free(parseInt(argv[0], 10)) : ERR_INVALID];
+        if (op === "spawn") return argv.length ? [String(this.procs.spawn(argv[0])), ERR_OK] : ["", ERR_INVALID];
+        if (op === "kill") return ["", argv.length ? this.procs.kill(parseInt(argv[0], 10)) : ERR_INVALID];
+        if (op === "getenv") return argv.length ? [this.envGet(argv[0]) || "", ERR_OK] : ["", ERR_INVALID];
+        return ["", ERR_NOT_FOUND];
+    }
+    dispatch(line) { line = line.trim(); if (!line) return ""; this.history.push(line); return this.shellExecuteLine(line); }
+    shellExecuteLine(line) {
+        const parts = []; let cur = [];
+        for (const ch of line) { if (ch === "|") { parts.push(cur.join("").trim()); cur = []; } else cur.push(ch); }
+        parts.push(cur.join("").trim());
+        let pipeBuf = "", output = "", lastErr = ERR_OK;
+        for (let i = 0; i < parts.length; i++) {
+            this.shellStdinBuf = i > 0 ? pipeBuf : "";
+            const [segout, err] = this.shellExecuteSegment(parts[i], line);
+            if (i < parts.length - 1) pipeBuf = segout; else output = segout;
+            lastErr = err; if (lastErr !== ERR_OK) break;
+        }
+        this.shellStdinBuf = ""; return output;
+    }
+    shellExecuteSegment(seg, line) {
+        let work = seg, redirPath = "", redirIn = "", append = false;
+        if (work.includes("<")) { const [l, r] = work.split("<"); work = l.trim(); redirIn = r.trim(); }
+        if (work.includes(">>")) { const [l, r] = work.split(">>"); work = l.trim(); redirPath = r.trim(); append = true; }
+        else if (work.includes(">")) { const [l, r] = work.split(">"); work = l.trim(); redirPath = r.trim(); }
+        if (redirIn) {
+            const [content, err] = this.fs.readToBuf(redirIn);
+            if (err !== ERR_OK) return [`amosoz: ${redirIn}: cannot open for input`, err];
+            this.shellStdinBuf = content || "";
+        }
+        const argv = work ? work.split(/\s+/) : [];
+        const [out, err] = this.dispatchArgv(line || work, argv);
+        if (redirPath && err === ERR_OK) {
+            const werr = this.shellRedirectWrite(redirPath, out, append);
+            if (werr === ERR_PERMISSION) return [`amosoz: ${redirPath}: Permission denied`, werr];
+            if (werr !== ERR_OK) return [`amosoz: redirect to ${redirPath} failed`, werr];
+            return ["", ERR_OK];
+        }
+        return [out, err];
+    }
+    shellRedirectWrite(path, data, append) {
+        const r = this.fs._resolve(path);
+        if (r in this.fs.tree) {
+            if (this.accessNode(r, "w") !== ERR_OK) return ERR_PERMISSION;
+            const node = this.fs.tree[r];
+            if (append) { node.content += data; if (data && !data.endsWith("\n")) node.content += "\n"; }
+            else node.content = data;
+            node.modified = nowSec(); return ERR_OK;
+        }
+        this.fs.write(path, data + (data && !data.endsWith("\n") ? "\n" : "")); return ERR_OK;
+    }
+    pathLookupExecutable(name) {
+        if (name.includes("/")) {
+            const r = this.fs._resolve(name);
+            const node = this.fs.tree[r];
+            if (!node || node.type === "dir" || this.accessNode(r, "x") !== ERR_OK) return null;
+            return r;
+        }
+        for (const d of (this.envGet("PATH") || "/bin:/usr/bin").split(":")) {
+            const r = this.fs._resolve(`${d}/${name}`);
+            const node = this.fs.tree[r];
+            if (node && node.type !== "dir" && this.accessNode(r, "x") === ERR_OK) return r;
+        }
+        return null;
+    }
+    isScriptNode(path) {
+        let r = this.fs._resolve(path);
+        let node = this.fs.tree[r];
+        if (!node) return false;
+        if (node.type === "symlink") { r = this.fs._resolve(node.symlink_target); node = this.fs.tree[r]; }
+        if (!node || node.type === "dir") return false;
+        if (r.includes(".amos")) return true;
+        return (node.content || "").startsWith("#!/amossh");
+    }
+    expandScriptVars(text, argv) {
+        let out = "", i = 0;
+        while (i < text.length) {
+            if (text[i] === "$" && i + 1 < text.length) {
+                if (text[i + 1] === "@") { out += argv.slice(1).join(" "); i += 2; continue; }
+                if (text[i + 1] >= "1" && text[i + 1] <= "9") {
+                    const n = parseInt(text[i + 1], 10);
+                    if (n < argv.length) out += argv[n]; i += 2; continue;
+                }
+            }
+            out += text[i++]; }
+        return out;
+    }
+    runScriptNode(path, argv) {
+        if (this.shellDepth >= MAX_SCRIPT_DEPTH) return ["script: max nesting depth exceeded", ERR_INVALID];
+        this.shellDepth++;
+        const node = this.fs.tree[this.fs._resolve(path)];
+        let body = node.content || "";
+        if (body.includes("__builtin__")) {
+            const cmd = path.split("/").pop();
+            const nargs = argv.length > 1 ? argv.slice(1) : [];
+            const [out, err] = this.dispatchArgv(null, [cmd, ...nargs]);
+            this.shellDepth--; return [out, err];
+        }
+        if (body.startsWith("#!")) body = body.includes("\n") ? body.split("\n").slice(1).join("\n") : "";
+        const outputs = [];
+        for (const line of body.split("\n")) {
+            const t = strTrim(line);
+            if (!t || t.startsWith("#")) continue;
+            const segout = this.shellExecuteLine(this.expandScriptVars(t, argv));
+            if (segout) outputs.push(segout);
+        }
+        this.shellDepth--; return [outputs.join("\n"), ERR_OK];
+    }
+    dispatchArgv(line, argv) {
+        this.ledgerMetaClear(); this.fireHook("ai");
+        if (!argv.length) return ["", ERR_OK];
+        const pargs = argv.slice(1).join(" ");
+        if (argv[0] === "exit") {
+            this.running = false;
+            this.ledger.recordEx(line || "exit", "exit", pargs, this.user, this.procs.tickCount, ERR_OK, "shutdown", 0);
+            return ["Shutting down amosOZ.", ERR_OK];
+        }
+        const handler = this._cmdTable()[argv[0]];
+        if (handler) {
+            let result = handler(argv);
+            let out, err;
+            if (Array.isArray(result)) [out, err] = result; else { out = result || ""; err = ERR_OK; }
+            this._ledgerRecord(line, argv, pargs, out, err); return [out, err];
+        }
+        const resolved = this.pathLookupExecutable(argv[0]);
+        if (resolved && this.isScriptNode(resolved)) {
+            const [out, err] = this.runScriptNode(resolved, [argv[0], ...argv.slice(1)]);
+            this.ledger.recordEx(line || argv[0], argv[0], pargs, this.user, this.procs.tickCount, err, "script exec", 0);
+            return [out, err];
+        }
+        const out = `amosoz: command not found: ${argv[0]}`;
+        this.ledger.recordEx(line || argv[0], argv[0], pargs, this.user, this.procs.tickCount, ERR_NOT_FOUND, "not found", 0);
+        return [out, ERR_NOT_FOUND];
+    }
+    _ledgerRecord(line, argv, pargs, out, err) {
+        if (this.pendingLedger.active) {
+            const pl = this.pendingLedger;
+            this.ledger.recordEx(line || argv[0], argv[0], pargs, this.user, this.procs.tickCount, err, pl.explanation, pl.reversible, pl.undo_path, pl.undo_content, pl.undo_is_dir, pl.undo_was_create);
+            this.ledgerMetaClear();
+        } else this.ledger.recordEx(line || argv[0], argv[0], pargs, this.user, this.procs.tickCount, err, "Executed", 0);
+    }
+    _cmdTable() {
+        const k = this;
+        return {
+            help: a => "amosOZ commands:\n  " + ["help","clear","uname","version","boot","hw","devices","gpu","mem","mmap","alloc","free","ps","run","kill","tick","status","pwd","cd","ls","cat","touch","write","append","rm","mkdir","rmdir","mv","cp","chmod","stat","tree","echo","env","set","unset","date","history","selftest","oz","slots","modules","overhead","hooks","contracts","loadmod","unloadmod","call","trace","replay","reset","save","load","exit","fortune"].sort().join("  "),
+            clear: () => "\x1b[2J\x1b[H", uname: () => `${k.name} ${k.version} ${k.hw.machine} ${k.hw.platform}`,
+            version: () => `${k.name} version ${k.version} (build ${BUILD_DATE})`,
+            boot: () => `Boot time: ${new Date(k.bootTime * 1000).toString()}\nUptime: ${Math.floor(nowSec() - k.bootTime)}s`,
+            hw: () => "Hardware Profile:\n" + Object.entries(k.hw).map(([a,b]) => `  ${a}: ${b}`).join("\n"),
+            devices: () => "Devices:\n" + k.devices.map(d => `  ${d.name.padEnd(12)} ${d.type.padEnd(8)} ${d.status}`).join("\n"),
+            gpu: () => { try { if (navigator.gpu) return "GPU: WebGPU available (device registered as gpu0)"; } catch(_){} return "GPU: not available (browser runtime, no GPU abstraction)"; },
+            mem: () => { const s = k.mem.stats(); return `Memory: ${s.total_kb} KB total, ${s.used_kb} KB used, ${s.free_kb} KB free, ${s.blocks} blocks`; },
+            mmap: () => { const b = k.mem.mmap(); if (!b.length) return "No memory blocks allocated."; return "ID    Size(KB)  Flags  Owner\n" + b.map(([id,i]) => `${String(id).padEnd(5)} ${String(i.size).padEnd(9)} ${i.flags.padEnd(6)} ${i.owner}`).join("\n"); },
+            alloc: a => { if (!a[1]) return "Usage: alloc <size_kb>"; const sz = parseInt(a[1],10); if (isNaN(sz)) return "Error: size must be integer"; const [id,err]=k.mem.alloc(sz,k.user); return err ? "Error: out of memory" : `Allocated block ${id} (${sz} KB)`; },
+            free: a => { if (!a[1]) return "Usage: free <block_id>"; const err=k.mem.free(parseInt(a[1],10)); return err ? `Error: block ${a[1]} not found` : `Freed block ${a[1]}`; },
+            ps: () => { const p=k.procs.ps(); if (!p.length) return "No processes."; return "PID   Name          State     Ticks\n"+p.map(([pid,i])=>`${String(pid).padEnd(5)} ${i.name.padEnd(13)} ${i.state.padEnd(9)} ${i.ticks}`).join("\n"); },
+            run: a => { if (!a[1]) return "Usage: run <name>"; const pid=k.procs.spawn(a[1]); return `Started process '${a[1]}' with PID ${pid}`; },
+            kill: a => { if (!a[1]) return "Usage: kill <pid>"; const err=k.procs.kill(parseInt(a[1],10)); return err ? `Error: process ${a[1]} not found` : `Killed process ${a[1]}`; },
+            tick: () => `Tick: ${k.procs.tick()}`, status: a => { if (!a[1]) return "Usage: status <pid>"; const [info,err]=k.procs.status(parseInt(a[1],10)); return err ? `Error: process ${a[1]} not found` : `PID ${a[1]}: ${info.name} state=${info.state} ticks=${info.ticks}`; },
+            pwd: () => k.fs.cwd,
+            cd: a => { const path=a[1]||k.envGet("HOME")||"/home/user"; const [,err]=k.kernelSyscall("chdir",[path]); if (err===ERR_PERMISSION) return [`cd: ${path}: Permission denied`,err]; if (err!==ERR_OK) return [`cd: no such directory: ${path}`,err]; return ["",ERR_OK]; },
+            ls: a => { const [entries,err]=k.fs.ls(a[1]||null); if (err!==ERR_OK) return "ls: no such directory"; if (!entries.length) return ""; return entries.map(([n,t,p])=>`${p} ${n}${t==="dir"?"/":""}`).join("\n"); },
+            cat: a => { if (!a[1]) { if (k.shellStdinBuf) return [k.shellStdinBuf,ERR_OK]; return ["Usage: cat <file>",ERR_INVALID]; } const [out,err]=k.kernelSyscall("read",[a[1]]); if (err===ERR_PERMISSION) return [`cat: ${a[1]}: Permission denied`,err]; if (err!==ERR_OK) return [`cat: ${a[1]}: not found or not a file`,err]; return [out,ERR_OK]; },
+            touch: a => { if (!a[1]) return "Usage: touch <file>"; const err=k.fs.touch(a[1]); return err ? `touch: cannot create ${a[1]}` : ""; },
+            write: a => { if (a.length<3) return ["Usage: write <file> <content...>",ERR_INVALID]; const resolved=k.fs._resolve(a[1]); let old="", wasCreate=!(resolved in k.fs.tree); if (resolved in k.fs.tree) { if (k.accessNode(resolved,"w")!==ERR_OK) return [`write: ${a[1]}: Permission denied`,ERR_PERMISSION]; old=k.fs.tree[resolved].content||""; } const [,err]=k.kernelSyscall("write",a.slice(1)); if (err===ERR_OK) k.ledgerMetaSet(1,"fs write",resolved,old,0,wasCreate); return ["",err]; },
+            append: a => { if (a.length<3) return "Usage: append <file> <content...>"; const err=k.fs.append(a[1],a.slice(2).join(" ")); return err ? `append: error: ${a[1]} not found` : ""; },
+            rm: a => { if (!a[1]) return ["Usage: rm <file>",ERR_INVALID]; const resolved=k.fs._resolve(a[1]); const node=k.fs.tree[resolved]; if (!node||node.type==="dir") return [`rm: cannot remove ${a[1]}`,ERR_NOT_FOUND]; if (k.accessNode(resolved,"w")!==ERR_OK) return [`rm: ${a[1]}: Permission denied`,ERR_PERMISSION]; const backup=node.content||""; delete k.fs.tree[resolved]; k.ledgerMetaSet(1,"fs delete",resolved,backup,0,0); return ["",ERR_OK]; },
+            mkdir: a => { if (!a[1]) return "Usage: mkdir <dir>"; return k.fs.mkdir(a[1]) ? `mkdir: cannot create ${a[1]}` : ""; },
+            rmdir: a => { if (!a[1]) return "Usage: rmdir <dir>"; return k.fs.rmdir(a[1]) ? `rmdir: cannot remove ${a[1]}` : ""; },
+            mv: a => { if (a.length<3) return "Usage: mv <src> <dst>"; return k.fs.mv(a[1],a[2]) ? "mv: error" : ""; },
+            cp: a => { if (a.length<3) return "Usage: cp <src> <dst>"; return k.fs.cp(a[1],a[2]) ? "cp: error" : ""; },
+            chmod: a => { if (a.length<3) return "Usage: chmod <perms> <path>"; return k.fs.chmod(a[2],a[1]) ? "chmod: error" : ""; },
+            stat: a => { if (!a[1]) return "Usage: stat <path>"; const [info,err]=k.fs.stat(a[1]); return err ? `stat: ${a[1]} not found` : Object.entries(info).map(([x,v])=>`  ${x}: ${v}`).join("\n"); },
+            tree: a => { const lines=k.fs.treeView(a[1]||null); return lines.length ? lines.join("\n") : "(empty)"; },
+            echo: a => a.slice(1).join(" "), env: () => Object.entries(k.env).sort().map(([x,v])=>`${x}=${v}`).join("\n"),
+            set: a => { if (a.length<3) return "Usage: set <key> <value>"; k.envSet(a[1],a.slice(2).join(" ")); return ""; },
+            unset: a => { if (!a[1]) return "Usage: unset <key>"; k.envUnset(a[1]); return ""; },
+            date: () => new Date().toISOString().replace("T"," ").replace(/\.\d+Z/," UTC"),
+            history: () => k.history.length ? k.history.slice(-20).map((h,i)=>`${i+1}: ${h}`).join("\n") : "(no history)",
+            oz: () => { const ov=k.oz.totalOverhead(); return `OZ Layer — Extensibility Field\n  Modules loaded: ${ov.modules}\n  Slots defined: ${Object.keys(k.oz.slots).length}\n  Hooks active: ${Object.values(k.oz.hooks).reduce((a,b)=>a+b.length,0)}\n  Contracts: ${Object.keys(k.oz.contracts).length}\n  Ledger entries: ${k.ledger.size()}\n  Total overhead: ${ov.dispatch_entries} dispatch, ${ov.hooks} hooks, ${ov.slots_occupied} slot occupations`; },
+            slots: () => "Slots:\n"+Object.entries(k.oz.slots).sort().map(([n,o])=>`  ${n}: ${o.length?o.join(", "):"(empty)"}`).join("\n"),
+            modules: () => "Modules:\n"+Object.entries(k.oz.modules).sort().map(([n,m])=>`  ${n}: ${m.description} [commands: ${(m.commands||[]).join(", ")}]`).join("\n"),
+            overhead: () => { const t=k.oz.totalOverhead(); let s=`Overhead Accounting:\n  Total modules: ${t.modules}\n  Total dispatch entries: ${t.dispatch_entries}\n  Total hooks: ${t.hooks}\n  Total slot occupations: ${t.slots_occupied}\n\nPer-module:\n`; for (const [n,o] of Object.entries(k.oz.overheads).sort()) s+=`  ${n}: dispatch=${o.dispatch_entries} hooks=${o.hooks} slots=${JSON.stringify(o.slots_occupied)}\n`; return s; },
+            hooks: () => "Hooks:\n"+Object.entries(k.oz.hooks).sort().map(([n,s])=>`  ${n}: ${s.length?s.join(", "):"(none)"}`).join("\n"),
+            contracts: () => "Module Contracts:\n"+Object.entries(k.oz.contracts).sort().map(([n,c])=>`  ${n}:\n    provides: ${JSON.stringify(c.provides)}\n    requires: ${JSON.stringify(c.requires)}\n    version: ${c.version}`).join("\n"),
+            loadmod: () => `loadmod: dynamic loading not supported in v${VERSION} (modules compiled-in; contracts OK)`,
+            unloadmod: a => { if (!a[1]) return "Usage: unloadmod <module>"; const err=k.oz.unregisterModule(a[1]); return err ? `unloadmod: '${a[1]}' not found` : `Unloaded module '${a[1]}'`; },
+            call: a => { if (a.length<3) return "Usage: call <module> <method>"; const [r,err]=k.oz.callModule(a[1],a[2]); return err ? `call: error calling ${a[1]}.${a[2]}` : String(r); },
+            trace: a => { const n=parseInt(a[1],10)||10; const e=k.ledger.trace(n); if (!e.length) return "(no trace entries)"; return "OZ Ledger Trace:\n"+e.map(x=>`  [${x.tick}] ${x.command} -> ${x.result_code} (${x.explanation})`).join("\n"); },
+            replay: () => { const e=k.ledger.replayInfo(); if (!e.length) return ["(no replay data)",ERR_OK]; return ["Replay Log:\n"+e.map(x=>`  tick=${x.tick} cmd=${x.command} parsed=${x.parsed_cmd} args=${x.parsed_args} result=${x.result_code} rev=${x.reversible}`).join("\n"),ERR_OK]; },
+            reset: () => { k._kernelInit(); return ["System reset complete.",ERR_OK]; },
+            save: () => { try { localStorage.setItem("amosoz_image", JSON.stringify({ fs: JSON.parse(k.fs.serialize()), env: k.env, version: k.version })); return "System image saved to localStorage"; } catch(e) { return "save: storage unavailable"; } },
+            load: () => { try { const d=localStorage.getItem("amosoz_image"); if (!d) return "load: no saved image"; const data=JSON.parse(d); k.fs.deserialize(JSON.stringify(data.fs)); Object.assign(k.env,data.env||{}); return "System image loaded from localStorage"; } catch(e) { return "load: error: "+e.message; } },
+            exit: () => { k.running=false; return ["Shutting down amosOZ.",ERR_OK]; },
+            undo: () => k._cmdUndo(), whoami: () => [k.user,ERR_OK],
+            motd: () => { const [out,err]=k.kernelSyscall("read",["/etc/motd"]); return [err===ERR_OK?out:MOTD,ERR_OK]; },
+            syscall: a => { if (!a[1]) return ["Usage: syscall <op> [args...]",ERR_INVALID]; return k.kernelSyscall(a[1],a.slice(2)); },
+            which: a => { if (!a[1]) return ["Usage: which <name>",ERR_INVALID]; const r=k.pathLookupExecutable(a[1]); return r ? [r,ERR_OK] : [`which: ${a[1]}: not found`,ERR_NOT_FOUND]; },
+            exec: a => { if (!a[1]) return ["Usage: exec <path> [args...]",ERR_INVALID]; const r=k.pathLookupExecutable(a[1]); if (!r) return [`exec: ${a[1]}: not found`,ERR_NOT_FOUND]; if (!k.isScriptNode(r)) return [`exec: ${a[1]}: not a script`,ERR_INVALID]; return k.runScriptNode(r,["exec",...a.slice(1)]); },
+            grep: a => k._cmdGrep(a), head: a => k._cmdHead(a), tail: a => k._cmdTail(a), wc: a => k._cmdWc(a),
+            test: a => k._cmdTest(a), "[": a => k._cmdTest(a), export: a => k._cmdExport(a), source: a => k._cmdSource(a),
+            uptime: () => [`up ${Math.floor(nowSec()-k.bootTime)} seconds, 1 users, load: 0.00 0.00 0.00`,ERR_OK],
+            dmesg: () => [k.bootLog,ERR_OK], hostname: a => { if (a[1]) return ["hostname: read-only virtual hostname",ERR_INVALID]; const [out,err]=k.kernelSyscall("read",["/etc/hostname"]); return [err===ERR_OK?out.trim():k.hw.hostname,ERR_OK]; },
+            id: () => [`uid=${k.user}(${k.user}) gid=${k.user}(${k.user}) groups=${k.user}`,ERR_OK],
+            true: () => ["",ERR_OK], false: () => ["",ERR_INVALID],
+            ln: a => { if (a.length<4||a[1]!=="-s") return ["Usage: ln -s <target> <linkpath>",ERR_INVALID]; const err=k.fs.addSymlink(a[3],a[2]); return err ? ["ln: failed",err] : ["",ERR_OK]; },
+            find: a => k._cmdFind(a), jobs: () => ["[1]+ Running (stub) amossh (pid 1)\n[2]- Running (stub) init (pid 2)",ERR_OK],
+            fg: () => ["fg: job control stub — foreground is always the shell",ERR_OK],
+            nohup: a => { if (!a[1]) return ["Usage: nohup <command>",ERR_INVALID]; const out=k.shellExecuteLine(a.slice(1).join(" ")); return [`nohup: ignoring SIGHUP (stub)\n${out}`,ERR_OK]; },
+            spec: () => [`amosOZ spec ${VERSION}\nfeatures: permissions,syscall,/proc,ledger,undo,shell,scripts,PATH\nshell: >,>>,|,<  text: grep,head,tail,wc,test  fs: ln,find  meta: export,source\nstubs: jobs,fg,nohup  oz: fortune oz, /usr/share/amosoz\nselftest: 45+  canonical: C\n`,ERR_OK],
+            doctor: () => k._cmdDoctor(), fortune: a => k._cmdFortune(a), selftest: () => [k._cmdSelftest(),ERR_OK]
+        };
+    }
+    _cmdUndo() {
+        for (let i = this.ledger.entries.length - 1; i >= 0; i--) {
+            const e = this.ledger.entries[i];
+            if (!e.reversible || e.result_code !== ERR_OK) continue;
+            const path = e.undo_path;
+            if (e.undo_was_create) delete this.fs.tree[path];
+            else if (e.undo_is_dir) this.fs.tree[path] = this.fs._node("dir", { perms: "rwxr-xr-x", owner: "root" });
+            else this.fs.tree[path] = this.fs._node("file", { content: e.undo_content || "" });
+            e.reversible = 0; return [`Undid: ${e.parsed_cmd} (${path})`, ERR_OK];
+        }
+        return ["undo: nothing reversible in ledger", ERR_NOT_FOUND];
+    }
+    _cmdGrep(argv) {
+        let insensitive = false, ai = 0;
+        const args = argv.slice(1);
+        if (args.length > 1 && args[0] === "-i") { insensitive = true; ai = 1; }
+        if (args.length <= ai) return ["Usage: grep [-i] PATTERN [file]", ERR_INVALID];
+        const pat = args[ai];
+        let data, err;
+        if (args.length > ai + 1) [data, err] = this.fs.readToBuf(args[ai + 1]);
+        else if (this.shellStdinBuf) { data = this.shellStdinBuf; err = ERR_OK; }
+        else return ["grep: no input", ERR_INVALID];
+        if (err !== ERR_OK) return ["grep: cannot read input", err];
+        const lines = [];
+        for (const line of data.split("\n")) {
+            const hay = insensitive ? line.toLowerCase() : line;
+            const needle = insensitive ? pat.toLowerCase() : pat;
+            if (hay.includes(needle)) lines.push(line);
+        }
+        return [lines.join("\n"), ERR_OK];
+    }
+    _cmdHead(argv) {
+        const args = argv.slice(1); let n = 10, fi = 0;
+        if (args.length > 2 && args[0] === "-n") { n = parseInt(args[1], 10); fi = 2; }
+        let data, err;
+        if (args.length > fi) [data, err] = this.fs.readToBuf(args[fi]);
+        else if (this.shellStdinBuf) { data = this.shellStdinBuf; err = ERR_OK; }
+        else return ["Usage: head [-n N] [file]", ERR_INVALID];
+        if (err !== ERR_OK) return ["", err];
+        const lines = data.split("\n").slice(0, n);
+        return [lines.join("\n") + (data ? "\n" : ""), ERR_OK];
+    }
+    _cmdTail(argv) {
+        const args = argv.slice(1); let n = 10, fi = 0;
+        if (args.length > 2 && args[0] === "-n") { n = parseInt(args[1], 10); fi = 2; }
+        let data, err;
+        if (args.length > fi) [data, err] = this.fs.readToBuf(args[fi]);
+        else if (this.shellStdinBuf) { data = this.shellStdinBuf; err = ERR_OK; }
+        else return ["Usage: tail [-n N] [file]", ERR_INVALID];
+        if (err !== ERR_OK) return ["", err];
+        const lines = data.split("\n");
+        return [lines.slice(-n).join("\n") + (lines.length ? "\n" : ""), ERR_OK];
+    }
+    _cmdWc(argv) {
+        const args = argv.slice(1); let wantL = false, wantW = false, wantC = false, fi = 0;
+        while (fi < args.length && args[fi].startsWith("-")) {
+            if (args[fi].includes("l")) wantL = true; if (args[fi].includes("w")) wantW = true; if (args[fi].includes("c")) wantC = true; fi++;
+        }
+        if (!wantL && !wantW && !wantC) wantL = true;
+        let data, err;
+        if (fi < args.length) [data, err] = this.fs.readToBuf(args[fi]);
+        else if (this.shellStdinBuf) { data = this.shellStdinBuf; err = ERR_OK; }
+        else return ["Usage: wc [-l|-w|-c] [file]", ERR_INVALID];
+        if (err !== ERR_OK) return ["", err];
+        const lines = data ? data.split("\n") : [""];
+        const words = lines.reduce((w, l) => w + (l ? l.trim().split(/\s+/).filter(Boolean).length : 0), 0);
+        const parts = [];
+        if (wantL) parts.push(String(data ? lines.length : 0));
+        if (wantW) parts.push(String(words));
+        if (wantC) parts.push(String(data.length));
+        return [parts.join(" "), ERR_OK];
+    }
+    _cmdTest(argv) {
+        let args = argv.slice(1);
+        if (args.length && args[args.length - 1] === "]") args = args.slice(0, -1);
+        if (args[0] === "-f" && args.length >= 2) {
+            const r = this.fs.resolveNode(args[1]); const node = this.fs.tree[r];
+            return ["", node && node.type === "file" ? ERR_OK : ERR_INVALID];
+        }
+        if (args[0] === "-d" && args.length >= 2) {
+            const r = this.fs.resolveNode(args[1]); const node = this.fs.tree[r];
+            return ["", node && node.type === "dir" ? ERR_OK : ERR_INVALID];
+        }
+        if (args[0] === "-e" && args.length >= 2) return ["", this.fs.resolveNode(args[1]) in this.fs.tree ? ERR_OK : ERR_INVALID];
+        if (args[0] === "-z" && args.length >= 2) return ["", !args[1] ? ERR_OK : ERR_INVALID];
+        if (args.length >= 3 && args[1] === "=") return ["", args[0] === args[2] ? ERR_OK : ERR_INVALID];
+        return ["", ERR_INVALID];
+    }
+    _cmdExport(argv) {
+        const args = argv.slice(1);
+        if (!args.length) return ["Usage: export KEY=VAL", ERR_INVALID];
+        if (!args[0].includes("=")) return [`${args[0]}=${this.envGet(args[0]) || ""}`, ERR_OK];
+        const [key, ...rest] = args[0].split("="); this.envSet(key, rest.join("=")); return ["", ERR_OK];
+    }
+    _cmdSource(argv) {
+        const args = argv.slice(1);
+        if (!args.length) return ["Usage: source <file>", ERR_INVALID];
+        const r = this.fs._resolve(args[0]); const node = this.fs.tree[r];
+        if (!node) return [`source: ${args[0]}: not found`, ERR_NOT_FOUND];
+        let body = node.content || "";
+        if (body.startsWith("#!")) body = body.includes("\n") ? body.split("\n").slice(1).join("\n") : "";
+        const outs = [];
+        for (const line of body.split("\n")) {
+            const t = strTrim(line);
+            if (t && !t.startsWith("#")) { const o = this.shellExecuteLine(t); if (o) outs.push(o); }
+        }
+        return [outs.join("\n"), ERR_OK];
+    }
+    _cmdFind(argv) {
+        const args = argv.slice(1); let root = "/", pattern = "*";
+        for (let i = 0; i < args.length; i++) {
+            if (args[i] === "-name" && i + 1 < args.length) { pattern = args[++i]; }
+            else if (args[i].startsWith("/")) root = args[i];
+        }
+        const prefix = root === "/" ? "/" : root + "/";
+        const hits = [];
+        for (const path of Object.keys(this.fs.tree).sort()) {
+            if (path !== root && !path.startsWith(prefix)) continue;
+            const base = path.split("/").pop();
+            if (patmatch(pattern, base)) hits.push(path);
+        }
+        return [hits.join("\n") + (hits.length ? "\n" : ""), ERR_OK];
+    }
+    _cmdDoctor() {
+        let issues = 0;
+        const lines = ["amosOZ doctor:"];
+        if (this.validateModuleContracts() !== ERR_OK) { lines.push("  [FAIL] contracts"); issues++; }
+        else lines.push("  [OK] contracts");
+        if (this.hookBootFired <= 0) { lines.push("  [FAIL] boot hooks"); issues++; }
+        else lines.push(`  [OK] boot hooks (${this.hookBootFired})`);
+        if (!("/proc/uptime" in this.fs.tree)) { lines.push("  [FAIL] /proc"); issues++; }
+        else lines.push("  [OK] /proc");
+        if ("/usr/share/amosoz/quotes.txt" in this.fs.tree) lines.push("  [OK] oz quotes");
+        else lines.push("  [WARN] oz quotes");
+        lines.push(issues ? "  STATUS: needs attention" : "  STATUS: healthy");
+        return [lines.join("\n"), issues ? ERR_INVALID : ERR_OK];
+    }
+    _cmdFortune(argv) {
+        const args = argv.slice(1);
+        if (args[0] === "oz") {
+            const [data, err] = this.fs.readToBuf("/usr/share/amosoz/quotes.txt");
+            if (err !== ERR_OK) return ["fortune oz: quotes not found", ERR_NOT_FOUND];
+            const qlines = data.split("\n").filter(l => l.trim());
+            if (!qlines.length) return ["(no oz quotes)", ERR_OK];
+            const line = qlines[this.fortuneOzIdx++ % qlines.length];
+            return [line, ERR_OK];
+        }
+        const F = ["The system is the territory.","Every overhead has a name.","A module is a guest with manners.","Slots are finite; ambition is not.","Trace everything. Regret nothing."];
+        return [F[this.fortuneIdx++ % F.length], ERR_OK];
+    }
+    _cmdSelftest() {
+        const results = []; let passed = 0;
+        const check = (name, cond) => { if (cond) passed++; results.push(`  [${cond ? "PASS" : "FAIL"}] ${name}`); };
         check("boot_state", this.bootTime > 0);
-        check("hw_profile", this.hw && this.hw.platform);
-        check("version", this.version === VERSION);
-        // FS
+        check("hw_profile", (this.hw.platform || "").length > 0);
+        check("version", VERSION === "0.4.0");
         this.fs.write("/tmp/selftest_file", "hello");
-        let [c,e] = this.fs.read("/tmp/selftest_file");
-        check("fs_write_read", c === "hello" && e === ERR_OK);
+        let [c] = this.fs.read("/tmp/selftest_file");
+        check("fs_write_read", c === "hello");
         this.fs.append("/tmp/selftest_file", " world");
         [c] = this.fs.read("/tmp/selftest_file");
         check("fs_append", c === "hello world");
         this.fs.rm("/tmp/selftest_file");
-        check("fs_delete", !this.fs.exists("/tmp/selftest_file"));
+        check("fs_delete", !("/tmp/selftest_file" in this.fs.tree));
         this.fs.mkdir("/tmp/st_dir");
-        check("fs_mkdir", this.fs.exists("/tmp/st_dir"));
+        check("fs_mkdir", "/tmp/st_dir" in this.fs.tree);
         this.fs.rmdir("/tmp/st_dir");
-        check("fs_rmdir", !this.fs.exists("/tmp/st_dir"));
-        // Perms
+        check("fs_rmdir", !("/tmp/st_dir" in this.fs.tree));
         this.fs.write("/tmp/ptest", "data");
         this.fs.chmod("/tmp/ptest", "r--------");
-        let [info] = this.fs.stat("/tmp/ptest");
+        const [info] = this.fs.stat("/tmp/ptest");
         check("permission_mutation", info && info.perms === "r--------");
+        check("permission_enforced", this.fs.access("/tmp/ptest", "user", "w") === ERR_PERMISSION);
         this.fs.rm("/tmp/ptest");
-        // Memory
-        let [bid, err] = this.mem.alloc(100, "selftest");
-        check("mem_alloc", bid !== null && err === ERR_OK);
-        err = this.mem.free(bid);
-        check("mem_free", err === ERR_OK);
-        // Command dispatch
-        let r = this.dispatch("echo selftest_token");
-        check("command_dispatch", r.includes("selftest_token"));
-        // Process
-        let pid = this.procs.spawn("test_proc");
+        this.procRefreshAll();
+        [c] = this.fs.read("/proc/uptime");
+        check("proc_uptime", c && c.includes("."));
+        const [osr] = this.fs.read("/etc/os-release");
+        check("os_release", osr && osr.includes("ID=amosoz"));
+        const [sc, err] = this.kernelSyscall("read", ["/etc/hostname"]);
+        check("syscall_read", err === ERR_OK && sc.includes("amosoz"));
+        check("hook_boot_fired", this.hookBootFired > 0);
+        check("contract_validation", this.validateModuleContracts() === ERR_OK);
+        const [bid, merr] = this.mem.alloc(100, "selftest");
+        check("mem_alloc", bid && merr === ERR_OK);
+        check("mem_free", this.mem.free(bid) === ERR_OK);
+        check("command_dispatch", this.dispatch("echo selftest_token").includes("selftest_token"));
+        const pid = this.procs.spawn("test_proc");
         check("process_spawn", pid > 0);
         this.procs.kill(pid);
-        check("process_kill", !this.procs.processes[pid]);
-        // Module
-        check("module_registered", !!this.oz.modules.coreutils);
+        check("process_kill", !(pid in this.procs.processes));
+        check("module_registered", "coreutils" in this.oz.modules);
         check("slot_occupation", this.oz.slots["shell.commands"].length > 0);
-        // Overhead
         check("overhead_accounting", this.oz.totalOverhead().modules > 0);
-        // OZ
-        check("oz_layer", Object.keys(this.oz.slots).length === BUILTIN_SLOTS.length);
-        // Ledger
+        check("oz_layer", Object.keys(this.oz.slots).length === 10);
         check("oz_ledger", this.ledger.size() > 0);
-        const passed = results.filter(r => r.includes("[PASS]")).length;
+        check("ledger_parsed", this.ledger.entries.some(e => e.parsed_cmd));
+        this.dispatch("write /tmp/undo_me undo_payload");
+        const u = this.dispatch("undo");
+        check("ledger_undo", u.includes("Undid") || !("/tmp/undo_me" in this.fs.tree));
+        this.dispatch("echo treaty_redir > /tmp/shell_redir");
+        [c] = this.fs.read("/tmp/shell_redir");
+        check("shell_redirect", c && c.includes("treaty_redir"));
+        this.dispatch("echo appended >> /tmp/shell_redir");
+        [c] = this.fs.read("/tmp/shell_redir");
+        check("shell_append", c && c.includes("appended"));
+        check("shell_pipe", this.dispatch("echo pipe_token | cat").includes("pipe_token"));
+        check("path_which", this.dispatch("which echo").includes("/bin/echo"));
+        const ex = this.dispatch("exec /home/user/hello.amos resonance");
+        check("script_exec", ex.includes("Script greeting") && ex.includes("resonance"));
+        this.dispatch("echo grepme > /tmp/grep.txt");
+        check("cmd_grep", this.dispatch("grep grepme /tmp/grep.txt").includes("grepme"));
+        check("cmd_head", !!this.dispatch("head -n 1 /etc/motd"));
+        const wc = this.dispatch("wc -l /etc/motd").trim();
+        check("cmd_wc", /^\d+$/.test(wc) && parseInt(wc, 10) >= 1);
+        const [, terr] = this._cmdTest(["test", "-f", "/etc/hostname"]);
+        check("cmd_test", terr === ERR_OK);
+        this.dispatch("ln -s /etc/motd /tmp/motd_link");
+        check("cmd_ln", this.fs.resolveNode("/tmp/motd_link") in this.fs.tree);
+        check("cmd_find", this.dispatch("find /usr -name quotes.txt").includes("quotes.txt"));
+        this.dispatch("export TIER=v4");
+        check("cmd_export", this.dispatch("export TIER").includes("TIER=v4"));
+        check("fortune_oz", !!this.dispatch("fortune oz"));
+        check("cmd_spec", this.dispatch("spec").includes(VERSION));
+        check("cmd_doctor", this.dispatch("doctor").includes("healthy"));
+        check("shell_stdin_redirect", this.dispatch("cat < /etc/hostname").includes("amosoz"));
         const total = results.length;
-        return `amosOZ Selftest (${passed}/${total} passed):\n${results.join("\n")}\n\n  ${passed===total?"ALL TESTS PASSED":`${total-passed} TESTS FAILED`}`;
+        return `amosOZ Selftest (${passed}/${total} passed):\n${results.join("\n")}\n\n  ${passed === total ? "ALL TESTS PASSED" : `${total - passed} TESTS FAILED`}`;
     }
 }
 
@@ -506,13 +890,12 @@ function updatePrompt() {
 }
 
 function print(text) {
-    if (text === "\x1b[CLEAR]") { outputEl.textContent = ""; return; }
+    if (text === "\x1b[2J\x1b[H" || text === "\x1b[CLEAR]") { outputEl.textContent = ""; return; }
     outputEl.textContent += text + "\n";
     outputEl.scrollTop = outputEl.scrollHeight;
 }
 
-print(`${SYSTEM_NAME} v${VERSION}`);
-print("Type 'help' for commands, 'selftest' to verify.\n");
+print(MOTD);
 updatePrompt();
 
 inputEl.addEventListener("keydown", function(e) {

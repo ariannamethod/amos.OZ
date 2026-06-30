@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS ?= -Wall -Wextra -O2
 LDFLAGS ?= -lm
 
-.PHONY: all run test test-shell test-all clean
+.PHONY: all run test test-shell test-py test-html test-parity test-all clean
 
 all: amosoz
 
@@ -18,7 +18,16 @@ test: amosoz
 test-shell: amosoz
 	sh tests/shell_treaty.sh
 
-test-all: test test-shell
+test-py:
+	printf 'selftest\nexit\n' | python3 amosoz.py
+
+test-html:
+	node tests/html_selftest.mjs
+
+test-parity:
+	sh tests/parity_runner.sh
+
+test-all: test test-shell test-py test-html
 
 clean:
 	rm -f amosoz amosoz_neo amosoz.img
