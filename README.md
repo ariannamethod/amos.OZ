@@ -2,7 +2,7 @@
 
 **The most atomic way to build a working OS-like environment from scratch.**
 
-amosOZ is a single-file OS environment in three forms: C, HTML/JS, Python. Not Linux — but **treaty-compatible** with Unix userland semantics.
+amosOZ is a single-file OS environment in three forms: C, HTML/JS, Python. Not **Treaty-compatible** with Unix userland semantics.
 
 **Canonical:** `amosoz.c` **v0.4.0** — reference implementation (llm.c-grade for OS).  
 **Parity:** `amosoz.py` + `amosoz.html` **v0.4.0** — triple parity complete (43/43 selftest each).
