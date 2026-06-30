@@ -15,10 +15,23 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdarg.h>
 
 #define VERSION "0.1.0"
 #define SYSTEM_NAME "amosOZ"
 #define BUILD_DATE "2026-06-30"
+
+/* Guard against snprintf overflow: clamp n to buffer size */
+static inline int safe_append(char *buf, int offset, int bufsz, const char *fmt, ...) __attribute__((format(printf,4,5)));
+static inline int safe_append(char *buf, int offset, int bufsz, const char *fmt, ...) {
+    if (offset >= bufsz) return offset;
+    va_list ap; va_start(ap, fmt);
+    int written = vsnprintf(buf + offset, bufsz - offset, fmt, ap);
+    va_end(ap);
+    if (written > 0) offset += written;
+    if (offset > bufsz) offset = bufsz;
+    return offset;
+}
 
 #define MAX_PATH 256
 #define MAX_CONTENT 4096
@@ -682,9 +695,9 @@ static int cmd_hw(char *out, int sz, int argc, char **argv) {
 
 static int cmd_devices(char *out, int sz, int argc, char **argv) {
     int n = 0;
-    n += snprintf(out+n, sz-n, "Devices:\n");
+    n = safe_append(out, n, sz, "Devices:\n");
     for (int i = 0; i < K.device_count; i++)
-        n += snprintf(out+n, sz-n, "  %-12s %-8s %s\n", K.devices[i].name, K.devices[i].type, K.devices[i].status);
+        n = safe_append(out, n, sz, "  %-12s %-8s %s\n", K.devices[i].name, K.devices[i].type, K.devices[i].status);
     return ERR_OK;
 }
 
@@ -704,10 +717,10 @@ static int cmd_mem(char *out, int sz, int argc, char **argv) {
 
 static int cmd_mmap(char *out, int sz, int argc, char **argv) {
     int n = 0, any = 0;
-    n += snprintf(out+n, sz-n, "ID    Size(KB)  Flags  Owner\n");
+    n = safe_append(out, n, sz, "ID    Size(KB)  Flags  Owner\n");
     for (int i = 0; i < K.mem.block_count; i++) {
         if (K.mem.blocks[i].used) {
-            n += snprintf(out+n, sz-n, "%-5d %-9d %-6s %s\n",
+            n = safe_append(out, n, sz, "%-5d %-9d %-6s %s\n",
                 K.mem.blocks[i].id, K.mem.blocks[i].size,
                 K.mem.blocks[i].flags, K.mem.blocks[i].owner);
             any = 1;
@@ -738,10 +751,10 @@ static int cmd_free(char *out, int sz, int argc, char **argv) {
 
 static int cmd_ps(char *out, int sz, int argc, char **argv) {
     int n = 0;
-    n += snprintf(out+n, sz-n, "PID   Name          State     Ticks\n");
+    n = safe_append(out, n, sz, "PID   Name          State     Ticks\n");
     for (int i = 0; i < MAX_PROCS; i++) {
         if (K.procs.procs[i].used)
-            n += snprintf(out+n, sz-n, "%-5d %-13s %-9s %d\n",
+            n = safe_append(out, n, sz, "%-5d %-13s %-9s %d\n",
                 K.procs.procs[i].pid, K.procs.procs[i].name,
                 K.procs.procs[i].state, K.procs.procs[i].ticks);
     }
@@ -826,7 +839,7 @@ static int cmd_ls(char *out, int sz, int argc, char **argv) {
         if (strncmp(K.fs.nodes[i].path, prefix, plen) != 0) continue;
         const char *rest = K.fs.nodes[i].path + plen;
         if (strlen(rest) == 0 || strchr(rest, '/') != NULL) continue;
-        n += snprintf(out+n, sz-n, "%s %s%s\n", K.fs.nodes[i].perms, rest,
+        n = safe_append(out, n, sz, "%s %s%s\n", K.fs.nodes[i].perms, rest,
                       K.fs.nodes[i].is_dir ? "/" : "");
     }
     if (n == 0) out[0] = '\0';
@@ -1004,8 +1017,8 @@ static int cmd_tree(char *out, int sz, int argc, char **argv) {
         int depth = 0;
         for (const char *c = rest; *c; c++) if (*c == '/') depth++;
         if (depth > 3) continue;
-        for (int d = 0; d < depth; d++) n += snprintf(out+n, sz-n, "  ");
-        n += snprintf(out+n, sz-n, "%s%s\n", rest, K.fs.nodes[i].is_dir ? "/" : "");
+        for (int d = 0; d < depth; d++) n = safe_append(out, n, sz, "  ");
+        n = safe_append(out, n, sz, "%s%s\n", rest, K.fs.nodes[i].is_dir ? "/" : "");
     }
     if (n == 0) snprintf(out, sz, "(empty)");
     return ERR_OK;
@@ -1014,8 +1027,8 @@ static int cmd_tree(char *out, int sz, int argc, char **argv) {
 static int cmd_echo(char *out, int sz, int argc, char **argv) {
     int n = 0;
     for (int i = 1; i < argc; i++) {
-        if (i > 1) n += snprintf(out+n, sz-n, " ");
-        n += snprintf(out+n, sz-n, "%s", argv[i]);
+        if (i > 1) n = safe_append(out, n, sz, " ");
+        n = safe_append(out, n, sz, "%s", argv[i]);
     }
     return ERR_OK;
 }
@@ -1023,7 +1036,7 @@ static int cmd_echo(char *out, int sz, int argc, char **argv) {
 static int cmd_env(char *out, int sz, int argc, char **argv) {
     int n = 0;
     for (int i = 0; i < K.env_count; i++)
-        n += snprintf(out+n, sz-n, "%s=%s\n", K.env[i].key, K.env[i].value);
+        n = safe_append(out, n, sz, "%s=%s\n", K.env[i].key, K.env[i].value);
     return ERR_OK;
 }
 
@@ -1057,7 +1070,7 @@ static int cmd_history(char *out, int sz, int argc, char **argv) {
     int n = 0;
     int start = K.history_count > 20 ? K.history_count - 20 : 0;
     for (int i = start; i < K.history_count; i++)
-        n += snprintf(out+n, sz-n, "%d: %s\n", i+1, K.history[i]);
+        n = safe_append(out, n, sz, "%d: %s\n", i+1, K.history[i]);
     if (n == 0) snprintf(out, sz, "(no history)");
     return ERR_OK;
 }
@@ -1078,26 +1091,26 @@ static int cmd_oz(char *out, int sz, int argc, char **argv) {
 
 static int cmd_slots(char *out, int sz, int argc, char **argv) {
     int n = 0;
-    n += snprintf(out+n, sz-n, "Slots:\n");
+    n = safe_append(out, n, sz, "Slots:\n");
     for (int i = 0; i < K.slot_count; i++) {
-        n += snprintf(out+n, sz-n, "  %s: ", K.slots[i].name);
-        if (K.slots[i].occupant_count == 0) n += snprintf(out+n, sz-n, "(empty)");
+        n = safe_append(out, n, sz, "  %s: ", K.slots[i].name);
+        if (K.slots[i].occupant_count == 0) n = safe_append(out, n, sz, "(empty)");
         else for (int j = 0; j < K.slots[i].occupant_count; j++)
-            n += snprintf(out+n, sz-n, "%s%s", j?", ":"", K.slots[i].occupants[j]);
-        n += snprintf(out+n, sz-n, "\n");
+            n = safe_append(out, n, sz, "%s%s", j?", ":"", K.slots[i].occupants[j]);
+        n = safe_append(out, n, sz, "\n");
     }
     return ERR_OK;
 }
 
 static int cmd_modules(char *out, int sz, int argc, char **argv) {
     int n = 0;
-    n += snprintf(out+n, sz-n, "Modules:\n");
+    n = safe_append(out, n, sz, "Modules:\n");
     for (int i = 0; i < K.module_count; i++) {
         if (!K.modules[i].loaded) continue;
-        n += snprintf(out+n, sz-n, "  %s: %s [commands:", K.modules[i].name, K.modules[i].description);
+        n = safe_append(out, n, sz, "  %s: %s [commands:", K.modules[i].name, K.modules[i].description);
         for (int j = 0; j < K.modules[i].cmd_count; j++)
-            n += snprintf(out+n, sz-n, " %s", K.modules[i].commands[j]);
-        n += snprintf(out+n, sz-n, "]\n");
+            n = safe_append(out, n, sz, " %s", K.modules[i].commands[j]);
+        n = safe_append(out, n, sz, "]\n");
     }
     return ERR_OK;
 }
@@ -1111,14 +1124,14 @@ static int cmd_overhead(char *out, int sz, int argc, char **argv) {
         total_hooks += K.modules[i].hook_count;
         total_slots += K.modules[i].slot_count;
     }
-    n += snprintf(out+n, sz-n, "Overhead Accounting:\n");
-    n += snprintf(out+n, sz-n, "  Total modules: %d\n", total_mods);
-    n += snprintf(out+n, sz-n, "  Total dispatch entries: %d\n", total_dispatch);
-    n += snprintf(out+n, sz-n, "  Total hooks: %d\n", total_hooks);
-    n += snprintf(out+n, sz-n, "  Total slot occupations: %d\n\nPer-module:\n", total_slots);
+    n = safe_append(out, n, sz, "Overhead Accounting:\n");
+    n = safe_append(out, n, sz, "  Total modules: %d\n", total_mods);
+    n = safe_append(out, n, sz, "  Total dispatch entries: %d\n", total_dispatch);
+    n = safe_append(out, n, sz, "  Total hooks: %d\n", total_hooks);
+    n = safe_append(out, n, sz, "  Total slot occupations: %d\n\nPer-module:\n", total_slots);
     for (int i = 0; i < K.module_count; i++) {
         if (!K.modules[i].loaded) continue;
-        n += snprintf(out+n, sz-n, "  %s: dispatch=%d hooks=%d slots=%d\n",
+        n = safe_append(out, n, sz, "  %s: dispatch=%d hooks=%d slots=%d\n",
             K.modules[i].name, K.modules[i].cmd_count, K.modules[i].hook_count, K.modules[i].slot_count);
     }
     return ERR_OK;
@@ -1126,29 +1139,29 @@ static int cmd_overhead(char *out, int sz, int argc, char **argv) {
 
 static int cmd_hooks(char *out, int sz, int argc, char **argv) {
     int n = 0;
-    n += snprintf(out+n, sz-n, "Hooks:\n");
+    n = safe_append(out, n, sz, "Hooks:\n");
     for (int i = 0; i < K.hook_count; i++) {
-        n += snprintf(out+n, sz-n, "  %s: ", K.hooks[i].name);
-        if (K.hooks[i].sub_count == 0) n += snprintf(out+n, sz-n, "(none)");
+        n = safe_append(out, n, sz, "  %s: ", K.hooks[i].name);
+        if (K.hooks[i].sub_count == 0) n = safe_append(out, n, sz, "(none)");
         else for (int j = 0; j < K.hooks[i].sub_count; j++)
-            n += snprintf(out+n, sz-n, "%s%s", j?", ":"", K.hooks[i].subscribers[j]);
-        n += snprintf(out+n, sz-n, "\n");
+            n = safe_append(out, n, sz, "%s%s", j?", ":"", K.hooks[i].subscribers[j]);
+        n = safe_append(out, n, sz, "\n");
     }
     return ERR_OK;
 }
 
 static int cmd_contracts(char *out, int sz, int argc, char **argv) {
     int n = 0;
-    n += snprintf(out+n, sz-n, "Module Contracts:\n");
+    n = safe_append(out, n, sz, "Module Contracts:\n");
     for (int i = 0; i < K.module_count; i++) {
         if (!K.modules[i].loaded) continue;
-        n += snprintf(out+n, sz-n, "  %s:\n    provides:", K.modules[i].name);
+        n = safe_append(out, n, sz, "  %s:\n    provides:", K.modules[i].name);
         for (int j = 0; j < K.modules[i].provides_count; j++)
-            n += snprintf(out+n, sz-n, " %s", K.modules[i].contract_provides[j]);
-        n += snprintf(out+n, sz-n, "\n    requires:");
+            n = safe_append(out, n, sz, " %s", K.modules[i].contract_provides[j]);
+        n = safe_append(out, n, sz, "\n    requires:");
         for (int j = 0; j < K.modules[i].requires_count; j++)
-            n += snprintf(out+n, sz-n, " %s", K.modules[i].contract_requires[j]);
-        n += snprintf(out+n, sz-n, "\n    version: %s\n", K.modules[i].contract_version);
+            n = safe_append(out, n, sz, " %s", K.modules[i].contract_requires[j]);
+        n = safe_append(out, n, sz, "\n    version: %s\n", K.modules[i].contract_version);
     }
     return ERR_OK;
 }
@@ -1183,10 +1196,10 @@ static int cmd_trace(char *out, int sz, int argc, char **argv) {
     int n = 0, count = 10;
     if (argc > 1) count = atoi(argv[1]);
     if (K.ledger.count == 0) { snprintf(out, sz, "(no trace entries)"); return ERR_OK; }
-    n += snprintf(out+n, sz-n, "OZ Ledger Trace:\n");
+    n = safe_append(out, n, sz, "OZ Ledger Trace:\n");
     int start = K.ledger.count > count ? K.ledger.count - count : 0;
     for (int i = start; i < K.ledger.count; i++)
-        n += snprintf(out+n, sz-n, "  [%d] %s -> %d (%s)\n",
+        n = safe_append(out, n, sz, "  [%d] %s -> %d (%s)\n",
             K.ledger.entries[i].tick, K.ledger.entries[i].command,
             K.ledger.entries[i].result_code, K.ledger.entries[i].explanation);
     return ERR_OK;
@@ -1195,9 +1208,9 @@ static int cmd_trace(char *out, int sz, int argc, char **argv) {
 static int cmd_replay(char *out, int sz, int argc, char **argv) {
     int n = 0;
     if (K.ledger.count == 0) { snprintf(out, sz, "(no replay data)"); return ERR_OK; }
-    n += snprintf(out+n, sz-n, "Replay Log:\n");
+    n = safe_append(out, n, sz, "Replay Log:\n");
     for (int i = 0; i < K.ledger.count; i++)
-        n += snprintf(out+n, sz-n, "  tick=%d cmd=%s result=%d\n",
+        n = safe_append(out, n, sz, "  tick=%d cmd=%s result=%d\n",
             K.ledger.entries[i].tick, K.ledger.entries[i].command, K.ledger.entries[i].result_code);
     return ERR_OK;
 }
@@ -1256,8 +1269,8 @@ static int cmd_selftest(char *out, int sz, int argc, char **argv) {
     int n = 0, passed = 0, total = 0;
     #define CHECK(name, cond) do { \
         total++; \
-        if (cond) { n += snprintf(out+n, sz-n, "  [PASS] %s\n", name); passed++; } \
-        else { n += snprintf(out+n, sz-n, "  [FAIL] %s\n", name); } \
+        if (cond) { n = safe_append(out, n, sz, "  [PASS] %s\n", name); passed++; } \
+        else { n = safe_append(out, n, sz, "  [FAIL] %s\n", name); } \
     } while(0)
 
     CHECK("boot_state", K.boot_time > 0);
